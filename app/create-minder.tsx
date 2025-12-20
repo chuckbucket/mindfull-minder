@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { View, Text, TextInput, StyleSheet, TouchableOpacity, Alert, Switch, ScrollView } from 'react-native';
+import { View, Text, TextInput, StyleSheet, TouchableOpacity, Alert, Switch, ScrollView, Modal, ActivityIndicator } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../context/ThemeContext';
@@ -28,6 +28,8 @@ export default function CreateMinderScreen() {
   const [scheduleAroundDnd, setScheduleAroundDnd] = useState(true);
   const [intervalType, setIntervalType] = useState(intervalOptions[0]);
   const [triggerTimesPreview, setTriggerTimesPreview] = useState<Date[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
 
   useEffect(() => {
     if (params.minderId) {
@@ -119,129 +121,157 @@ export default function CreateMinderScreen() {
       return;
     }
 
-    log.info(`Saving minder: ${name}`);
+    setProgress(0);
+    setIsProcessing(true);
 
-    const numQuantity = parseInt(quantity, 10) || 1;
-    if (reminderFrequency === 'Daily' && numQuantity > 24) {
-        Alert.alert('Error', 'Maximum daily triggers is 24.');
-        return;
-    }
-    if (reminderFrequency === 'Weekly' && numQuantity > 100) {
-        Alert.alert('Error', 'Maximum weekly triggers is 100.');
-        return;
-    }
+    try {
+        log.info(`Saving minder: ${name}`);
 
-    let triggerTimes = [];
-    if (reminderFrequency !== 'Continuous' && intervalType === 'Equal') {
-        await calculateTriggerTimesPreview(); // Use the preview calculation
-        triggerTimes = triggerTimesPreview.map(t => ({ hours: t.getHours(), minutes: t.getMinutes() }));
-    }
+        const numQuantity = parseInt(quantity, 10) || 1;
+        if (reminderFrequency === 'Daily' && numQuantity > 24) {
+            Alert.alert('Error', 'Maximum daily triggers is 24.');
+            setIsProcessing(false);
+            return;
+        }
+        if (reminderFrequency === 'Weekly' && numQuantity > 100) {
+            Alert.alert('Error', 'Maximum weekly triggers is 100.');
+            setIsProcessing(false);
+            return;
+        }
 
-    const newMinder = {
-      id: minderId || `${Date.now()}-${Math.random()}`,
-      name,
-      color: selectedColor,
-      reminderFrequency,
-      quantity: numQuantity,
-      note,
-      scheduleAroundDnd,
-      intervalType,
-      triggerTimes, // Stored for Equal intervals
-      successStreak: minderId ? undefined : 0,
-    };
+        let triggerTimes = [];
+        if (reminderFrequency !== 'Continuous' && intervalType === 'Equal') {
+            await calculateTriggerTimesPreview(); // Use the preview calculation
+            triggerTimes = triggerTimesPreview.map(t => ({ hours: t.getHours(), minutes: t.getMinutes() }));
+        }
 
-    const storedMinders = await AsyncStorage.getItem(MINDERS_STORAGE_KEY);
-    let minders = storedMinders ? JSON.parse(storedMinders) : [];
-    if (minderId) {
-      minders = minders.map((m: any) => m.id === minderId ? newMinder : m);
-    } else {
-      minders.push(newMinder);
-    }
+        const newMinder = {
+          id: minderId || `${Date.now()}-${Math.random()}`,
+          name,
+          color: selectedColor,
+          reminderFrequency,
+          quantity: numQuantity,
+          note,
+          scheduleAroundDnd,
+          intervalType,
+          triggerTimes, // Stored for Equal intervals
+          successStreak: minderId ? undefined : 0,
+        };
 
-    await AsyncStorage.setItem(MINDERS_STORAGE_KEY, JSON.stringify(minders));
-    log.info(`Minder saved: ${JSON.stringify(newMinder)}`);
-    await scheduleNotificationsForMinder(newMinder);
-    if (router.canGoBack()) {
-      router.back();
-    } else {
-      router.replace('/(tabs)');
+        const storedMinders = await AsyncStorage.getItem(MINDERS_STORAGE_KEY);
+        let minders = storedMinders ? JSON.parse(storedMinders) : [];
+        if (minderId) {
+          minders = minders.map((m: any) => m.id === minderId ? newMinder : m);
+        } else {
+          minders.push(newMinder);
+        }
+
+        await AsyncStorage.setItem(MINDERS_STORAGE_KEY, JSON.stringify(minders));
+        log.info(`Minder saved: ${JSON.stringify(newMinder)}`);
+        await scheduleNotificationsForMinder(newMinder, setProgress);
+
+        setIsProcessing(false);
+
+        if (router.canGoBack()) {
+          router.back();
+        } else {
+          router.replace('/(tabs)');
+        }
+    } catch (error) {
+        setIsProcessing(false);
+        log.error('Error saving minder:', error);
+        Alert.alert('Error', 'An error occurred while saving the minder.');
     }
   };
 
   return (
     <View style={{flex: 1, backgroundColor: colors.background}}>
-    <ScrollView style={[styles.container, { backgroundColor: colors.background }]}>
-      <TextInput
-        style={[styles.input, { color: colors.text, backgroundColor: colors.card }]}
-        placeholder="Minder Name"
-        placeholderTextColor={colors.text}
-        value={name}
-        onChangeText={setName}
-      />
-      <View style={styles.optionGroup}>
-        <Text style={{ color: colors.text }}>Color:</Text>
-        <View style={styles.colorContainer}>
-          {colorsOptions.map(color => (
-            <TouchableOpacity key={color} onPress={() => setSelectedColor(color)}>
-              <View style={[styles.colorOption, { backgroundColor: color, borderWidth: selectedColor === color ? 2 : 0, borderColor: colors.text }]} />
-            </TouchableOpacity>
-          ))}
-        </View>
-      </View>
-      <View style={styles.optionGroup}>
-        <Text style={{ color: colors.text }}>Reminder Frequency:</Text>
-        <View style={styles.buttonContainer}>
-          {frequencyOptions.map(freq => (
-            <TouchableOpacity key={freq} style={[styles.button, { backgroundColor: reminderFrequency === freq ? colors.primary : colors.card }]} onPress={() => setReminderFrequency(freq)}>
-              <Text style={{ color: reminderFrequency === freq ? 'white' : colors.text }}>{freq}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-      </View>
-      {reminderFrequency !== 'Continuous' && (
-        <>
-            <TextInput
-                style={[styles.input, { color: colors.text, backgroundColor: colors.card, marginTop: 10 }]}
-                placeholder="Times per day/week"
-                placeholderTextColor={colors.text}
-                value={quantity}
-                onChangeText={setQuantity}
-                keyboardType="numeric"
-            />
-            <View style={[styles.optionGroup, {justifyContent: 'space-between'}]}>
-                <Text style={{ color: colors.text }}>Schedule around DND:</Text>
-                <Switch value={scheduleAroundDnd} onValueChange={setScheduleAroundDnd} />
-            </View>
-            <View style={styles.optionGroup}>
-                <Text style={{ color: colors.text }}>Interval Type:</Text>
-                <View style={styles.buttonContainer}>
-                {intervalOptions.map(type => (
-                    <TouchableOpacity key={type} style={[styles.button, { backgroundColor: intervalType === type ? colors.primary : colors.card }]} onPress={() => setIntervalType(type)}>
-                    <Text style={{ color: intervalType === type ? 'white' : colors.text }}>{type}</Text>
-                    </TouchableOpacity>
-                ))}
+        <Modal
+            transparent={true}
+            animationType="fade"
+            visible={isProcessing}
+            onRequestClose={() => {}}>
+            <View style={styles.modalBackground}>
+                <View style={[styles.activityIndicatorWrapper, {backgroundColor: colors.card}]}>
+                    <Text style={{ color: colors.text, marginBottom: 15, fontSize: 16 }}>Scheduling... {Math.round(progress * 100)}%</Text>
+                    <View style={styles.progressBarContainer}>
+                        <View style={[styles.progressBar, { width: `${progress * 100}%`, backgroundColor: colors.primary }]} />
+                    </View>
                 </View>
             </View>
-            <View style={styles.triggerTimesContainer}>
-                <Text style={{ color: colors.text, fontWeight: 'bold' }}>Upcoming Triggers Preview:</Text>
-                {triggerTimesPreview.map((time, index) => (
-                    <Text key={index} style={{ color: colors.text }}>{time.toLocaleString()}</Text>
-                ))}
+        </Modal>
+        <ScrollView style={[styles.container, { backgroundColor: colors.background }]}>
+        <TextInput
+            style={[styles.input, { color: colors.text, backgroundColor: colors.card }]}
+            placeholder="Minder Name"
+            placeholderTextColor={colors.text}
+            value={name}
+            onChangeText={setName}
+        />
+        <View style={styles.optionGroup}>
+            <Text style={{ color: colors.text }}>Color:</Text>
+            <View style={styles.colorContainer}>
+            {colorsOptions.map(color => (
+                <TouchableOpacity key={color} onPress={() => setSelectedColor(color)}>
+                <View style={[styles.colorOption, { backgroundColor: color, borderWidth: selectedColor === color ? 2 : 0, borderColor: colors.text }]} />
+                </TouchableOpacity>
+            ))}
             </View>
-        </>
-      )}
-      <TextInput
-        style={[styles.input, { color: colors.text, backgroundColor: colors.card, marginTop: 10, height: 100 }]}
-        placeholder="Note (optional)"
-        placeholderTextColor={colors.text}
-        value={note}
-        onChangeText={setNote}
-        multiline
-      />
-      <TouchableOpacity style={[styles.saveButton, { backgroundColor: colors.primary }]} onPress={handleSave}>
-        <Text style={styles.saveButtonText}>Save Minder</Text>
-      </TouchableOpacity>
-    </ScrollView>
+        </View>
+        <View style={styles.optionGroup}>
+            <Text style={{ color: colors.text }}>Reminder Frequency:</Text>
+            <View style={styles.buttonContainer}>
+            {frequencyOptions.map(freq => (
+                <TouchableOpacity key={freq} style={[styles.button, { backgroundColor: reminderFrequency === freq ? colors.primary : colors.card }]} onPress={() => setReminderFrequency(freq)}>
+                <Text style={{ color: reminderFrequency === freq ? 'white' : colors.text }}>{freq}</Text>
+                </TouchableOpacity>
+            ))}
+            </View>
+        </View>
+        {reminderFrequency !== 'Continuous' && (
+            <>
+                <TextInput
+                    style={[styles.input, { color: colors.text, backgroundColor: colors.card, marginTop: 10 }]}
+                    placeholder="Times per day/week"
+                    placeholderTextColor={colors.text}
+                    value={quantity}
+                    onChangeText={setQuantity}
+                    keyboardType="numeric"
+                />
+                <View style={[styles.optionGroup, {justifyContent: 'space-between'}]}>
+                    <Text style={{ color: colors.text }}>Schedule around DND:</Text>
+                    <Switch value={scheduleAroundDnd} onValueChange={setScheduleAroundDnd} />
+                </View>
+                <View style={styles.optionGroup}>
+                    <Text style={{ color: colors.text }}>Interval Type:</Text>
+                    <View style={styles.buttonContainer}>
+                    {intervalOptions.map(type => (
+                        <TouchableOpacity key={type} style={[styles.button, { backgroundColor: intervalType === type ? colors.primary : colors.card }]} onPress={() => setIntervalType(type)}>
+                        <Text style={{ color: intervalType === type ? 'white' : colors.text }}>{type}</Text>
+                        </TouchableOpacity>
+                    ))}
+                    </View>
+                </View>
+                <View style={styles.triggerTimesContainer}>
+                    <Text style={{ color: colors.text, fontWeight: 'bold' }}>Upcoming Triggers Preview:</Text>
+                    {triggerTimesPreview.map((time, index) => (
+                        <Text key={index} style={{ color: colors.text }}>{time.toLocaleString()}</Text>
+                    ))}
+                </View>
+            </>
+        )}
+        <TextInput
+            style={[styles.input, { color: colors.text, backgroundColor: colors.card, marginTop: 10, height: 100 }]}
+            placeholder="Note (optional)"
+            placeholderTextColor={colors.text}
+            value={note}
+            onChangeText={setNote}
+            multiline
+        />
+        <TouchableOpacity style={[styles.saveButton, { backgroundColor: colors.primary }]} onPress={handleSave}>
+            <Text style={styles.saveButtonText}>Save Minder</Text>
+        </TouchableOpacity>
+        </ScrollView>
     </View>
   );
 }
@@ -301,5 +331,31 @@ const styles = StyleSheet.create({
       backgroundColor: '#f0f0f0',
       borderRadius: 5,
       marginBottom: 20,
+  },
+  modalBackground: {
+    flex: 1,
+    alignItems: 'center',
+    flexDirection: 'column',
+    justifyContent: 'space-around',
+    backgroundColor: '#00000040'
+  },
+  activityIndicatorWrapper: {
+    padding: 25,
+    borderRadius: 10,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-around',
+    width: '70%'
+  },
+  progressBarContainer: {
+    height: 10,
+    width: '100%',
+    backgroundColor: '#e0e0e0',
+    borderRadius: 5,
+    overflow: 'hidden',
+  },
+  progressBar: {
+    height: '100%',
+    borderRadius: 5,
   }
 });
