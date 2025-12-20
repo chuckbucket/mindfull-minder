@@ -43,6 +43,13 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "deaf59fa-fe50-41fa-bb04-becca07324cb"
+      }
+    },
+    "owner": "kncbricks"
   }
 }

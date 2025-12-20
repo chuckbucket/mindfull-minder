@@ -1,227 +1,247 @@
 import { useState, useEffect } from 'react';
-import { StyleSheet, Text, View, TextInput, Switch, TouchableOpacity, Alert, Platform } from 'react-native';
-import SegmentedControl from '@react-native-segmented-control/segmented-control';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Crypto from 'expo-crypto';
+import { View, Text, TextInput, StyleSheet, TouchableOpacity, Alert, Switch, ScrollView } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../context/ThemeContext';
-import { scheduleNotificationsForMinder, cancelNotificationsForMinder } from '../logic/NotificationManager';
+import { scheduleNotificationsForMinder } from '../logic/NotificationManager';
+import { log } from '../logic/Logger';
+import 'react-native-get-random-values';
 
 const MINDERS_STORAGE_KEY = '@minders';
+const DND_ENABLED_KEY = '@dndEnabled';
+const DND_SETTINGS_KEY = '@dndSettings';
+
+const colorsOptions = ['#FF6B6B', '#FFD166', '#06D6A0', '#118AB2', '#073B4C'];
+const frequencyOptions = ['Continuous', 'Daily', 'Weekly'];
+const intervalOptions = ['Equal', 'Random'];
 
 export default function CreateMinderScreen() {
   const { colors } = useTheme();
   const router = useRouter();
-  const { minderId } = useLocalSearchParams();
-
+  const params = useLocalSearchParams();
+  const [minderId, setMinderId] = useState<string | null>(null);
   const [name, setName] = useState('');
-  const [color, setColor] = useState(colors.palette.blue);
-  const [note, setNote] = useState('');
-  const [reminderFrequencyIndex, setReminderFrequencyIndex] = useState(0);
+  const [selectedColor, setSelectedColor] = useState(colorsOptions[0]);
+  const [reminderFrequency, setReminderFrequency] = useState(frequencyOptions[1]);
   const [quantity, setQuantity] = useState('1');
-  const [distributionIndex, setDistributionIndex] = useState(0);
-  const [preventDnd, setPreventDnd] = useState(false);
-  const [isEditMode, setIsEditMode] = useState(false);
-  const [minders, setMinders] = useState<any[]>([]);
-
-  const reminderFrequencies = ['Daily', 'Weekly', 'X per day', 'X per week', 'Continuous'];
-  const distributions = ['Equally Spread', 'Random'];
-  const colorPalette = Object.values(colors.palette);
+  const [note, setNote] = useState('');
+  const [scheduleAroundDnd, setScheduleAroundDnd] = useState(true);
+  const [intervalType, setIntervalType] = useState(intervalOptions[0]);
+  const [triggerTimesPreview, setTriggerTimesPreview] = useState<Date[]>([]);
 
   useEffect(() => {
-    const loadMindersForStreak = async () => {
-        const storedMinders = await AsyncStorage.getItem(MINDERS_STORAGE_KEY);
-        if (storedMinders) {
-            setMinders(JSON.parse(storedMinders))
-        }
+    if (params.minderId) {
+      log.info(`Loading minder with ID: ${params.minderId}`);
+      setMinderId(params.minderId as string);
+      loadMinderData(params.minderId as string);
     }
-    loadMindersForStreak()
-    if (minderId) {
-      setIsEditMode(true);
-      loadMinder(minderId as string);
-    }
-  }, [minderId]);
+  }, [params.minderId]);
 
-  const loadMinder = async (id: string) => {
-    try {
-      const storedMinders = await AsyncStorage.getItem(MINDERS_STORAGE_KEY);
-      if (storedMinders) {
-        const minders = JSON.parse(storedMinders);
-        const minderToEdit = minders.find((m: any) => m.id === id);
-        if (minderToEdit) {
-          setName(minderToEdit.name);
-          setColor(minderToEdit.color);
-          setNote(minderToEdit.note);
-          setReminderFrequencyIndex(reminderFrequencies.indexOf(minderToEdit.reminderFrequency));
-          setQuantity(minderToEdit.quantity || '1');
-          setDistributionIndex(distributions.indexOf(minderToEdit.distribution || 'Equally Spread'));
-          setPreventDnd(minderToEdit.preventDnd || false);
-        }
+  const loadMinderData = async (id: string) => {
+    const storedMinders = await AsyncStorage.getItem(MINDERS_STORAGE_KEY);
+    if (storedMinders) {
+      const minders = JSON.parse(storedMinders);
+      const minderToEdit = minders.find((m: any) => m.id === id);
+      if (minderToEdit) {
+        setName(minderToEdit.name);
+        setSelectedColor(minderToEdit.color);
+        setReminderFrequency(minderToEdit.reminderFrequency);
+        setQuantity(minderToEdit.quantity.toString());
+        setNote(minderToEdit.note || '');
+        setScheduleAroundDnd(minderToEdit.scheduleAroundDnd || true);
+        setIntervalType(minderToEdit.intervalType || intervalOptions[0]);
       }
-    } catch (e) {
-      console.error('Failed to load minder for editing.', e);
     }
   };
 
-  const saveMinder = async () => {
-    if (!name) {
+  useEffect(() => {
+    if (reminderFrequency !== 'Continuous') {
+      calculateTriggerTimesPreview();
+    }
+  }, [name, reminderFrequency, quantity, scheduleAroundDnd, intervalType]);
+
+  const calculateTriggerTimesPreview = async () => {
+    const dndSettingsEnabled = scheduleAroundDnd ? await AsyncStorage.getItem(DND_ENABLED_KEY) : null;
+    const dndSettings = scheduleAroundDnd ? await AsyncStorage.getItem(DND_SETTINGS_KEY) : null;
+    const enabled = dndSettingsEnabled ? JSON.parse(dndSettingsEnabled) : {};
+    const allSettings = dndSettings ? JSON.parse(dndSettings) : [];
+
+    const isDndActive = (time: Date) => {
+        if (!scheduleAroundDnd) return false;
+        const dayOfWeek = time.getDay();
+        const currentTime = time.getHours() * 60 + time.getMinutes();
+        for (const setting of allSettings) {
+            if (enabled[setting.id] && setting.days.includes(dayOfWeek)) {
+                const [startHour, startMinute] = setting.startTime.split(':').map(Number);
+                const [endHour, endMinute] = setting.endTime.split(':').map(Number);
+                const startTime = startHour * 60 + startMinute;
+                const endTime = endHour * 60 + endMinute;
+                if (startTime <= endTime) {
+                    if (currentTime >= startTime && currentTime <= endTime) return true;
+                } else {
+                    if (currentTime >= startTime || currentTime <= endTime) return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    const now = new Date();
+    let times: Date[] = [];
+    const totalQuantity = parseInt(quantity, 10) || 1;
+
+    let interval, timeSpan;
+    if (reminderFrequency === 'Daily') {
+        timeSpan = 24 * 60 * 60 * 1000;
+    } else { // Weekly
+        timeSpan = 7 * 24 * 60 * 60 * 1000;
+    }
+    interval = timeSpan / totalQuantity;
+
+    for (let i = 0; i < totalQuantity; i++) {
+        let potentialTime = new Date(now.getTime() + i * interval);
+        if (intervalType === 'Random') {
+            const randomOffset = (Math.random() - 0.5) * 30 * 60 * 1000;
+            potentialTime.setTime(potentialTime.getTime() + randomOffset);
+        }
+
+        while (isDndActive(potentialTime)) {
+            potentialTime.setTime(potentialTime.getTime() + 30 * 60 * 1000);
+        }
+        times.push(potentialTime);
+    }
+    setTriggerTimesPreview(times);
+  };
+
+  const handleSave = async () => {
+    if (!name.trim()) {
       Alert.alert('Error', 'Please enter a name for the minder.');
       return;
     }
 
-    const isContinuous = reminderFrequencies[reminderFrequencyIndex] === 'Continuous';
-    const newMinderId = isEditMode ? minderId : Crypto.randomUUID();
+    log.info(`Saving minder: ${name}`);
 
-    const minderData = {
-      id: newMinderId,
+    const numQuantity = parseInt(quantity, 10) || 1;
+    if (reminderFrequency === 'Daily' && numQuantity > 24) {
+        Alert.alert('Error', 'Maximum daily triggers is 24.');
+        return;
+    }
+    if (reminderFrequency === 'Weekly' && numQuantity > 100) {
+        Alert.alert('Error', 'Maximum weekly triggers is 100.');
+        return;
+    }
+
+    let triggerTimes = [];
+    if (reminderFrequency !== 'Continuous' && intervalType === 'Equal') {
+        await calculateTriggerTimesPreview(); // Use the preview calculation
+        triggerTimes = triggerTimesPreview.map(t => ({ hours: t.getHours(), minutes: t.getMinutes() }));
+    }
+
+    const newMinder = {
+      id: minderId || `${Date.now()}-${Math.random()}`,
       name,
-      color,
+      color: selectedColor,
+      reminderFrequency,
+      quantity: numQuantity,
       note,
-      reminderFrequency: reminderFrequencies[reminderFrequencyIndex],
-      quantity: reminderFrequencyIndex > 1 && !isContinuous ? quantity : null,
-      distribution: reminderFrequencyIndex > 1 && !isContinuous ? distributions[distributionIndex] : null,
-      preventDnd,
-      successStreak: isContinuous ? (isEditMode ? (minders.find((m: any) => m.id === minderId)?.successStreak || 0) : 0) : null,
+      scheduleAroundDnd,
+      intervalType,
+      triggerTimes, // Stored for Equal intervals
+      successStreak: minderId ? undefined : 0,
     };
 
-    try {
-      const existingMinders = await AsyncStorage.getItem(MINDERS_STORAGE_KEY);
-      const currentMinders = existingMinders ? JSON.parse(existingMinders) : [];
-      if (isEditMode) {
-        const index = currentMinders.findIndex((m: any) => m.id === minderId);
-        currentMinders[index] = minderData;
-      } else {
-        currentMinders.push(minderData);
-      }
-      await AsyncStorage.setItem(MINDERS_STORAGE_KEY, JSON.stringify(currentMinders));
-
-      if (!isContinuous) {
-        await scheduleNotificationsForMinder(minderData);
-      } else {
-        await cancelNotificationsForMinder(minderData.id as string);
-      }
-
-      Alert.alert('Success', `Minder ${isEditMode ? 'updated' : 'saved'}!`, [
-        { text: 'OK', onPress: () => router.push('/(tabs)') },
-      ]);
-    } catch (error) {
-      console.error('Error saving minder:', error);
-      Alert.alert('Error', 'There was an error saving the minder.');
+    const storedMinders = await AsyncStorage.getItem(MINDERS_STORAGE_KEY);
+    let minders = storedMinders ? JSON.parse(storedMinders) : [];
+    if (minderId) {
+      minders = minders.map((m: any) => m.id === minderId ? newMinder : m);
+    } else {
+      minders.push(newMinder);
     }
-  };
-  
-  const deleteMinder = async () => {
-    if (!minderId) return;
 
-    Alert.alert(
-        'Delete Minder',
-        'Are you sure you want to delete this minder?',
-        [
-          { text: 'Cancel', style: 'cancel' },
-          {
-            text: 'Delete',
-            style: 'destructive',
-            onPress: async () => {
-                try {
-                    await cancelNotificationsForMinder(minderId as string);
-                    const existingMinders = await AsyncStorage.getItem(MINDERS_STORAGE_KEY);
-                    const minders = existingMinders ? JSON.parse(existingMinders) : [];
-                    const newMinders = minders.filter((m: any) => m.id !== minderId);
-                    await AsyncStorage.setItem(MINDERS_STORAGE_KEY, JSON.stringify(newMinders));
-                    Alert.alert('Success', 'Minder deleted!', [
-                      { text: 'OK', onPress: () => router.push('/(tabs)') },
-                    ]);
-                  } catch (error) {
-                    console.error('Error deleting minder:', error);
-                    Alert.alert('Error', 'There was an error deleting the minder.');
-                  }
-            }
-          }
-        ]
-      )
+    await AsyncStorage.setItem(MINDERS_STORAGE_KEY, JSON.stringify(minders));
+    log.info(`Minder saved: ${JSON.stringify(newMinder)}`);
+    await scheduleNotificationsForMinder(newMinder);
+    if (router.canGoBack()) {
+      router.back();
+    } else {
+      router.replace('/(tabs)');
+    }
   };
 
   return (
-    <View style={[styles.container, { backgroundColor: colors.background }]}>
-      <Text style={[styles.title, { color: colors.text }]}>{isEditMode ? 'Edit Minder' : 'Create a New Minder'}</Text>
-      
+    <View style={{flex: 1, backgroundColor: colors.background}}>
+    <ScrollView style={[styles.container, { backgroundColor: colors.background }]}>
       <TextInput
-        style={[styles.input, { color: colors.text, borderColor: colors.border }]}
+        style={[styles.input, { color: colors.text, backgroundColor: colors.card }]}
         placeholder="Minder Name"
         placeholderTextColor={colors.text}
         value={name}
         onChangeText={setName}
       />
-      
-      <View style={styles.colorContainer}>
-        <Text style={[styles.label, { color: colors.text }]}>Color:</Text>
-        <View style={styles.colorPalette}>
-          {colorPalette.map(c => (
-            <TouchableOpacity 
-              key={c}
-              style={[styles.colorSwatch, { backgroundColor: c, borderColor: color === c ? colors.primary : colors.border }]}
-              onPress={() => setColor(c)}
-            />
+      <View style={styles.optionGroup}>
+        <Text style={{ color: colors.text }}>Color:</Text>
+        <View style={styles.colorContainer}>
+          {colorsOptions.map(color => (
+            <TouchableOpacity key={color} onPress={() => setSelectedColor(color)}>
+              <View style={[styles.colorOption, { backgroundColor: color, borderWidth: selectedColor === color ? 2 : 0, borderColor: colors.text }]} />
+            </TouchableOpacity>
           ))}
         </View>
       </View>
-
+      <View style={styles.optionGroup}>
+        <Text style={{ color: colors.text }}>Reminder Frequency:</Text>
+        <View style={styles.buttonContainer}>
+          {frequencyOptions.map(freq => (
+            <TouchableOpacity key={freq} style={[styles.button, { backgroundColor: reminderFrequency === freq ? colors.primary : colors.card }]} onPress={() => setReminderFrequency(freq)}>
+              <Text style={{ color: reminderFrequency === freq ? 'white' : colors.text }}>{freq}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      </View>
+      {reminderFrequency !== 'Continuous' && (
+        <>
+            <TextInput
+                style={[styles.input, { color: colors.text, backgroundColor: colors.card, marginTop: 10 }]}
+                placeholder="Times per day/week"
+                placeholderTextColor={colors.text}
+                value={quantity}
+                onChangeText={setQuantity}
+                keyboardType="numeric"
+            />
+            <View style={[styles.optionGroup, {justifyContent: 'space-between'}]}>
+                <Text style={{ color: colors.text }}>Schedule around DND:</Text>
+                <Switch value={scheduleAroundDnd} onValueChange={setScheduleAroundDnd} />
+            </View>
+            <View style={styles.optionGroup}>
+                <Text style={{ color: colors.text }}>Interval Type:</Text>
+                <View style={styles.buttonContainer}>
+                {intervalOptions.map(type => (
+                    <TouchableOpacity key={type} style={[styles.button, { backgroundColor: intervalType === type ? colors.primary : colors.card }]} onPress={() => setIntervalType(type)}>
+                    <Text style={{ color: intervalType === type ? 'white' : colors.text }}>{type}</Text>
+                    </TouchableOpacity>
+                ))}
+                </View>
+            </View>
+            <View style={styles.triggerTimesContainer}>
+                <Text style={{ color: colors.text, fontWeight: 'bold' }}>Upcoming Triggers Preview:</Text>
+                {triggerTimesPreview.map((time, index) => (
+                    <Text key={index} style={{ color: colors.text }}>{time.toLocaleString()}</Text>
+                ))}
+            </View>
+        </>
+      )}
       <TextInput
-        style={[styles.input, { color: colors.text, borderColor: colors.border, height: 100 }]}
-        placeholder="Notes"
+        style={[styles.input, { color: colors.text, backgroundColor: colors.card, marginTop: 10, height: 100 }]}
+        placeholder="Note (optional)"
         placeholderTextColor={colors.text}
         value={note}
         onChangeText={setNote}
         multiline
       />
-
-      <Text style={[styles.label, { color: colors.text }]}>Reminder Criteria</Text>
-      <SegmentedControl
-        values={reminderFrequencies}
-        selectedIndex={reminderFrequencyIndex}
-        onChange={(event) => {
-          setReminderFrequencyIndex(event.nativeEvent.selectedSegmentIndex);
-        }}
-      />
-
-      {(reminderFrequencyIndex === 2 || reminderFrequencyIndex === 3) && (
-        <>
-          <TextInput
-            style={[styles.input, { color: colors.text, borderColor: colors.border }]}
-            placeholder="Quantity"
-            placeholderTextColor={colors.text}
-            value={quantity}
-            onChangeText={setQuantity}
-            keyboardType="numeric"
-          />
-          <SegmentedControl
-            values={distributions}
-            selectedIndex={distributionIndex}
-            onChange={(event) => {
-              setDistributionIndex(event.nativeEvent.selectedSegmentIndex);
-            }}
-          />
-        </>
-      )}
-
-      <View style={styles.dndContainer}>
-        <Text style={[styles.label, { color: colors.text }]}>Prevent during DND</Text>
-        <Switch
-          value={preventDnd}
-          onValueChange={setPreventDnd}
-          thumbColor={colors.primary}
-        />
-      </View>
-      
-      <TouchableOpacity style={[styles.saveButton, { backgroundColor: colors.primary }]} onPress={saveMinder}>
-        <Text style={styles.saveButtonText}>{isEditMode ? 'Update Minder' : 'Save Minder'}</Text>
+      <TouchableOpacity style={[styles.saveButton, { backgroundColor: colors.primary }]} onPress={handleSave}>
+        <Text style={styles.saveButtonText}>Save Minder</Text>
       </TouchableOpacity>
-      
-      {isEditMode && (
-        <TouchableOpacity style={[styles.saveButton, { backgroundColor: 'red', marginTop: 16 }]} onPress={deleteMinder}>
-          <Text style={styles.saveButtonText}>Delete Minder</Text>
-        </TouchableOpacity>
-      )}
+    </ScrollView>
     </View>
   );
 }
@@ -231,52 +251,55 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 16,
   },
-  title: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    marginBottom: 24,
-    textAlign: 'center',
-  },
   input: {
-    borderWidth: 1,
-    borderRadius: 8,
     padding: 12,
+    borderRadius: 8,
     marginBottom: 16,
-    width: '100%',
-  },
-  label: {
     fontSize: 16,
-    fontWeight: '500',
-    marginBottom: 8,
+  },
+  optionGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 16,
   },
   colorContainer: {
-    marginBottom: 16,
-  },
-  colorPalette: {
     flexDirection: 'row',
     justifyContent: 'space-around',
+    flex: 1,
   },
-  colorSwatch: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    borderWidth: 2,
+  colorOption: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
   },
-  dndContainer: {
+  buttonContainer: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginTop: 24,
+    justifyContent: 'flex-end',
+    flex: 1,
+    gap: 8,
+  },
+  button: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
   },
   saveButton: {
     padding: 16,
     borderRadius: 8,
     alignItems: 'center',
-    marginTop: 32,
+    marginTop: 20,
+    marginBottom: 20,
   },
   saveButtonText: {
     color: 'white',
-    fontWeight: 'bold',
     fontSize: 18,
+    fontWeight: 'bold',
   },
+  triggerTimesContainer: {
+      marginTop: 16,
+      padding: 10,
+      backgroundColor: '#f0f0f0',
+      borderRadius: 5,
+      marginBottom: 20,
+  }
 });

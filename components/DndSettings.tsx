@@ -1,128 +1,118 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TextInput, StyleSheet, Button, TouchableOpacity } from 'react-native';
+import { View, Text, Switch, StyleSheet } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../context/ThemeContext';
+import { scheduleNotificationsForAllMinders } from '../logic/NotificationManager';
 
-const DND_STORAGE_KEY = '@dndSettings';
-const daysOfWeek = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const DND_ENABLED_KEY = '@dndEnabled';
 
-interface DndSettings {
-  startTime: string;
-  endTime: string;
-  enabledDays: number[];
-}
+const dndItems = [
+  {
+    id: 'evenings',
+    title: 'Evenings (10pm - 8am)',
+    startTime: '22:00',
+    endTime: '08:00',
+    days: [0, 1, 2, 3, 4, 5, 6], // Every day
+  },
+  {
+    id: 'workday',
+    title: 'Workday (8am - 5pm)',
+    startTime: '08:00',
+    endTime: '17:00',
+    days: [1, 2, 3, 4, 5], // Mon-Fri
+  },
+  {
+    id: 'weekends',
+    title: 'Weekends',
+    startTime: '00:00',
+    endTime: '23:59',
+    days: [0, 6], // Sunday, Saturday
+  },
+];
+
+export const DND_SETTINGS_KEY = '@dndSettings';
 
 export default function DndSettings() {
   const { colors } = useTheme();
-  const [settings, setSettings] = useState<DndSettings>({ startTime: '22:00', endTime: '06:00', enabledDays: [] });
+  const [enabledSettings, setEnabledSettings] = useState<{[key: string]: boolean}>({});
 
   useEffect(() => {
-    loadSettings();
+    const storeFullDndSettings = async () => {
+      await AsyncStorage.setItem(DND_SETTINGS_KEY, JSON.stringify(dndItems));
+    }
+    storeFullDndSettings();
+    loadEnabledSettings();
   }, []);
 
-  const loadSettings = async () => {
+  const loadEnabledSettings = async () => {
     try {
-      const storedSettings = await AsyncStorage.getItem(DND_STORAGE_KEY);
-      if (storedSettings) {
-        setSettings(JSON.parse(storedSettings));
+      const storedEnabled = await AsyncStorage.getItem(DND_ENABLED_KEY);
+      if (storedEnabled) {
+        setEnabledSettings(JSON.parse(storedEnabled));
+      } else {
+        const defaultEnabled: {[key: string]: boolean} = {};
+        dndItems.forEach(item => defaultEnabled[item.id] = false);
+        setEnabledSettings(defaultEnabled);
       }
     } catch (e) {
-      console.error('Failed to load DND settings.', e);
+      console.error('Failed to load DND enabled settings.', e);
     }
   };
 
-  const saveSettings = async () => {
+  const toggleSwitch = async (id: string) => {
+    const newEnabledSettings = {
+      ...enabledSettings,
+      [id]: !enabledSettings[id],
+    };
+    setEnabledSettings(newEnabledSettings);
     try {
-      await AsyncStorage.setItem(DND_STORAGE_KEY, JSON.stringify(settings));
-      alert('DND settings saved!');
+      await AsyncStorage.setItem(DND_ENABLED_KEY, JSON.stringify(newEnabledSettings));
+      await scheduleNotificationsForAllMinders();
+      alert('DND settings updated and notifications rescheduled.');
     } catch (e) {
-      console.error('Failed to save DND settings.', e);
+      console.error('Failed to save DND enabled settings.', e);
     }
-  };
-
-  const toggleDay = (dayIndex: number) => {
-    const { enabledDays } = settings;
-    const newEnabledDays = enabledDays.includes(dayIndex)
-      ? enabledDays.filter(d => d !== dayIndex)
-      : [...enabledDays, dayIndex];
-    setSettings({ ...settings, enabledDays: newEnabledDays });
   };
 
   return (
     <View style={[styles.container, { backgroundColor: colors.card, borderColor: colors.border }]}>
       <Text style={[styles.title, { color: colors.text }]}>Do Not Disturb</Text>
-      <View style={styles.timeContainer}>
-        <TextInput
-          style={[styles.timeInput, { color: colors.text, borderColor: colors.border }]}
-          value={settings.startTime}
-          onChangeText={(text) => setSettings({ ...settings, startTime: text })}
-        />
-        <Text style={{ color: colors.text }}>to</Text>
-        <TextInput
-          style={[styles.timeInput, { color: colors.text, borderColor: colors.border }]}
-          value={settings.endTime}
-          onChangeText={(text) => setSettings({ ...settings, endTime: text })}
-        />
-      </View>
-      <View style={styles.daysContainer}>
-        {daysOfWeek.map((day, index) => (
-          <TouchableOpacity
-            key={index}
-            style={[
-              styles.dayButton,
-              {
-                backgroundColor: settings.enabledDays.includes(index) ? colors.primary : colors.background,
-                borderColor: colors.border,
-              }
-            ]}
-            onPress={() => toggleDay(index)}
-          >
-            <Text style={{ color: settings.enabledDays.includes(index) ? 'white' : colors.text }}>{day}</Text>
-          </TouchableOpacity>
-        ))}
-      </View>
-      <Button title="Save DND" onPress={saveSettings} color={colors.primary} />
+      {dndItems.map((item) => (
+        <View key={item.id} style={styles.dndItem}>
+          <Text style={[styles.dndTitle, { color: colors.text }]}>{item.title}</Text>
+          <Switch
+            trackColor={{ false: '#767577', true: colors.primary }}
+            thumbColor={enabledSettings[item.id] ? colors.primary : '#f4f3f4'}
+            ios_backgroundColor="#3e3e3e"
+            onValueChange={() => toggleSwitch(item.id)}
+            value={enabledSettings[item.id] || false}
+          />
+        </View>
+      ))}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    width: '100%',
-    padding: 16,
-    borderRadius: 8,
-    borderWidth: 1,
-    marginBottom: 16,
-  },
-  title: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 16,
-  },
-  timeContainer: {
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  timeInput: {
-    borderWidth: 1,
-    borderRadius: 5,
-    padding: 8,
-    width: 80,
-    textAlign: 'center',
-  },
-  daysContainer: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 16,
-  },
-  dayButton: {
-    borderWidth: 1,
-    borderRadius: 20,
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
+    container: {
+        width: '100%',
+        padding: 16,
+        borderRadius: 8,
+        borderWidth: 1,
+        marginBottom: 16,
+    },
+    title: {
+        fontSize: 20,
+        fontWeight: 'bold',
+        marginBottom: 16,
+    },
+    dndItem: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        paddingVertical: 8,
+    },
+    dndTitle: {
+        fontSize: 16,
+    }
 });
