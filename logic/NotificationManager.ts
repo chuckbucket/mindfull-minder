@@ -1,6 +1,8 @@
 import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Alert } from 'react-native';
 import { log } from './Logger';
+import { isWithinTimeWindow, moveDateIntoTimeWindow, parseClockTimeToMinutes } from './TimeWindow';
 
 const MINDERS_STORAGE_KEY = '@minders';
 const DND_ENABLED_KEY = '@dndEnabled';
@@ -84,6 +86,10 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
     const timeSpan = (minderData.reminderFrequency === 'Daily' ? 24 : 7 * 24) * 60 * 60 * 1000;
     const interval = timeSpan / minderData.quantity;
 
+    const startMinutes = typeof minderData.notificationStartTime === 'string' ? parseClockTimeToMinutes(minderData.notificationStartTime) : null;
+    const endMinutes = typeof minderData.notificationEndTime === 'string' ? parseClockTimeToMinutes(minderData.notificationEndTime) : null;
+    const hasWindow = startMinutes !== null && endMinutes !== null && startMinutes !== endMinutes;
+
     let currentTime = now.getTime();
 
     while (currentTime < scheduleUntil.getTime() && newNotificationTimes.length < availableSlots) {
@@ -94,11 +100,26 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
             nextTime.setTime(nextTime.getTime() + randomOffset);
         }
 
-        if (minderData.scheduleAroundDnd) {
-            while (await isDndActive(nextTime) && nextTime < scheduleUntil) {
+        if (hasWindow && startMinutes !== null && endMinutes !== null) {
+            nextTime = moveDateIntoTimeWindow(nextTime, startMinutes, endMinutes);
+        }
+
+        while (nextTime < scheduleUntil) {
+            if (hasWindow && startMinutes !== null && endMinutes !== null && !isWithinTimeWindow(nextTime, startMinutes, endMinutes)) {
+                nextTime = moveDateIntoTimeWindow(nextTime, startMinutes, endMinutes);
+                continue;
+            }
+
+            if (minderData.scheduleAroundDnd && (await isDndActive(nextTime))) {
                 log.debug(`DND active at ${nextTime}, postponing notification.`);
                 nextTime.setTime(nextTime.getTime() + 30 * 60 * 1000);
+                if (hasWindow && startMinutes !== null && endMinutes !== null) {
+                    nextTime = moveDateIntoTimeWindow(nextTime, startMinutes, endMinutes);
+                }
+                continue;
             }
+
+            break;
         }
 
         if (nextTime < scheduleUntil && nextTime > now) {
@@ -119,9 +140,10 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
         try {
             await Notifications.scheduleNotificationAsync({
                 content: {
-                    title: 'Minders',
-                    body: minderData.name,
-                    data: { minderId: minderData.id },
+                    title: minderData.name,
+                    body: 'Reminder',
+                    data: { minderId: minderData.id, minderName: minderData.name },
+                    categoryIdentifier: 'MINDER_REMINDER',
                 },
                 trigger: {
                     type: Notifications.SchedulableTriggerInputTypes.DATE,

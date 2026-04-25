@@ -4,6 +4,8 @@ import { Stack } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import { useEffect } from 'react';
 import { ThemeProvider } from '../context/ThemeContext';
+import * as Notifications from 'expo-notifications';
+import { addMinderEvent } from '../logic/MinderEvents';
 
 export {
   // Catch any errors thrown by the Layout component.
@@ -43,6 +45,61 @@ export default function RootLayout() {
 }
 
 function RootLayoutNav() {
+  useEffect(() => {
+    void Notifications.setNotificationCategoryAsync('MINDER_REMINDER', [
+      {
+        identifier: 'SNOOZE_15_MIN',
+        buttonTitle: 'Snooze 15m',
+        options: { opensAppToForeground: false },
+      },
+    ]);
+
+    const onReceived = Notifications.addNotificationReceivedListener(notification => {
+      const minderId = (notification.request.content.data as any)?.minderId;
+      if (typeof minderId !== 'string') return;
+      const triggerDateValue = (notification.request.trigger as any)?.date;
+      const triggerAt = triggerDateValue ? new Date(triggerDateValue).getTime() : undefined;
+      const at = Date.now();
+      const id = `triggered:${minderId}:${typeof triggerAt === 'number' && !Number.isNaN(triggerAt) ? triggerAt : at}`;
+      void addMinderEvent({ id, minderId, kind: 'triggered', at, triggerAt });
+    });
+
+    const onResponse = Notifications.addNotificationResponseReceivedListener(response => {
+      const minderId = (response.notification.request.content.data as any)?.minderId;
+      if (typeof minderId !== 'string') return;
+
+      const triggerDateValue = (response.notification.request.trigger as any)?.date;
+      const triggerAt = triggerDateValue ? new Date(triggerDateValue).getTime() : undefined;
+      const minderName = (response.notification.request.content.data as any)?.minderName;
+      const at = Date.now();
+
+      if (response.actionIdentifier === 'SNOOZE_15_MIN') {
+        const snoozeAt = new Date(Date.now() + 15 * 60 * 1000);
+        void Notifications.scheduleNotificationAsync({
+          content: {
+            title: typeof minderName === 'string' ? minderName : 'Minder',
+            body: 'Reminder (Snoozed)',
+            data: { minderId, minderName: typeof minderName === 'string' ? minderName : undefined, snoozedFromTriggerAt: triggerAt },
+            categoryIdentifier: 'MINDER_REMINDER',
+          },
+          trigger: {
+            type: Notifications.SchedulableTriggerInputTypes.DATE,
+            date: snoozeAt,
+          },
+        });
+        return;
+      }
+
+      const id = `opened:${minderId}:${typeof triggerAt === 'number' && !Number.isNaN(triggerAt) ? triggerAt : at}`;
+      void addMinderEvent({ id, minderId, kind: 'triggered', at, triggerAt });
+    });
+
+    return () => {
+      onReceived.remove();
+      onResponse.remove();
+    };
+  }, []);
+
   return (
     <ThemeProvider>
       <Stack>

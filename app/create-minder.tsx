@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react';
-import { View, Text, TextInput, StyleSheet, TouchableOpacity, Alert, Switch, ScrollView, Modal, ActivityIndicator } from 'react-native';
+import { useState, useEffect, useCallback } from 'react';
+import { View, Text, TextInput, StyleSheet, TouchableOpacity, Alert, Switch, ScrollView, Modal } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../context/ThemeContext';
 import { scheduleNotificationsForMinder } from '../logic/NotificationManager';
 import { log } from '../logic/Logger';
+import { isWithinTimeWindow, moveDateIntoTimeWindow, parseClockTimeToMinutes } from '../logic/TimeWindow';
 import 'react-native-get-random-values';
 
 const MINDERS_STORAGE_KEY = '@minders';
@@ -15,6 +16,26 @@ const colorsOptions = ['#FF6B6B', '#FFD166', '#06D6A0', '#118AB2', '#073B4C'];
 const frequencyOptions = ['Continuous', 'Daily', 'Weekly'];
 const intervalOptions = ['Equal', 'Random'];
 
+const buildTimeOptions = () => {
+  const options: string[] = [];
+  for (let minutes = 0; minutes < 24 * 60; minutes += 30) {
+    const hh = String(Math.floor(minutes / 60)).padStart(2, '0');
+    const mm = String(minutes % 60).padStart(2, '0');
+    options.push(`${hh}:${mm}`);
+  }
+  return options;
+};
+
+const formatTimeLabel = (hhmm: string) => {
+  const parsed = parseClockTimeToMinutes(hhmm);
+  if (parsed === null) return hhmm;
+  const hours24 = Math.floor(parsed / 60);
+  const minutes = parsed % 60;
+  const suffix = hours24 >= 12 ? 'PM' : 'AM';
+  const hours12 = ((hours24 + 11) % 12) + 1;
+  return `${hours12}:${String(minutes).padStart(2, '0')} ${suffix}`;
+};
+
 export default function CreateMinderScreen() {
   const { colors } = useTheme();
   const router = useRouter();
@@ -23,13 +44,17 @@ export default function CreateMinderScreen() {
   const [name, setName] = useState('');
   const [selectedColor, setSelectedColor] = useState(colorsOptions[0]);
   const [reminderFrequency, setReminderFrequency] = useState(frequencyOptions[1]);
-  const [quantity, setQuantity] = useState('1');
+  const [quantity, setQuantity] = useState(1);
   const [note, setNote] = useState('');
   const [scheduleAroundDnd, setScheduleAroundDnd] = useState(true);
   const [intervalType, setIntervalType] = useState(intervalOptions[0]);
   const [triggerTimesPreview, setTriggerTimesPreview] = useState<Date[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [notificationStartTime, setNotificationStartTime] = useState('08:00');
+  const [notificationEndTime, setNotificationEndTime] = useState('20:00');
+  const [timePickerVisible, setTimePickerVisible] = useState(false);
+  const [timePickerTarget, setTimePickerTarget] = useState<'start' | 'end'>('start');
 
   useEffect(() => {
     if (params.minderId) {
@@ -48,21 +73,17 @@ export default function CreateMinderScreen() {
         setName(minderToEdit.name);
         setSelectedColor(minderToEdit.color);
         setReminderFrequency(minderToEdit.reminderFrequency);
-        setQuantity(minderToEdit.quantity.toString());
+        setQuantity(typeof minderToEdit.quantity === 'number' ? minderToEdit.quantity : Number(minderToEdit.quantity) || 1);
         setNote(minderToEdit.note || '');
         setScheduleAroundDnd(minderToEdit.scheduleAroundDnd || true);
         setIntervalType(minderToEdit.intervalType || intervalOptions[0]);
+        setNotificationStartTime(minderToEdit.notificationStartTime || '08:00');
+        setNotificationEndTime(minderToEdit.notificationEndTime || '20:00');
       }
     }
   };
 
-  useEffect(() => {
-    if (reminderFrequency !== 'Continuous') {
-      calculateTriggerTimesPreview();
-    }
-  }, [name, reminderFrequency, quantity, scheduleAroundDnd, intervalType]);
-
-  const calculateTriggerTimesPreview = async () => {
+  const calculateTriggerTimesPreview = useCallback(async () => {
     const dndSettingsEnabled = scheduleAroundDnd ? await AsyncStorage.getItem(DND_ENABLED_KEY) : null;
     const dndSettings = scheduleAroundDnd ? await AsyncStorage.getItem(DND_SETTINGS_KEY) : null;
     const enabled = dndSettingsEnabled ? JSON.parse(dndSettingsEnabled) : {};
@@ -89,8 +110,8 @@ export default function CreateMinderScreen() {
     };
 
     const now = new Date();
-    let times: Date[] = [];
-    const totalQuantity = parseInt(quantity, 10) || 1;
+    const times: Date[] = [];
+    const totalQuantity = quantity || 1;
 
     let interval, timeSpan;
     if (reminderFrequency === 'Daily') {
@@ -100,6 +121,10 @@ export default function CreateMinderScreen() {
     }
     interval = timeSpan / totalQuantity;
 
+    const startMinutes = parseClockTimeToMinutes(notificationStartTime);
+    const endMinutes = parseClockTimeToMinutes(notificationEndTime);
+    const hasWindow = startMinutes !== null && endMinutes !== null && startMinutes !== endMinutes;
+
     for (let i = 0; i < totalQuantity; i++) {
         let potentialTime = new Date(now.getTime() + i * interval);
         if (intervalType === 'Random') {
@@ -107,13 +132,34 @@ export default function CreateMinderScreen() {
             potentialTime.setTime(potentialTime.getTime() + randomOffset);
         }
 
-        while (isDndActive(potentialTime)) {
+        if (hasWindow && startMinutes !== null && endMinutes !== null) {
+          potentialTime = moveDateIntoTimeWindow(potentialTime, startMinutes, endMinutes);
+        }
+
+        while (
+          (hasWindow && startMinutes !== null && endMinutes !== null && !isWithinTimeWindow(potentialTime, startMinutes, endMinutes)) ||
+          isDndActive(potentialTime)
+        ) {
+            if (hasWindow && startMinutes !== null && endMinutes !== null) {
+              potentialTime = moveDateIntoTimeWindow(potentialTime, startMinutes, endMinutes);
+              if (isWithinTimeWindow(potentialTime, startMinutes, endMinutes) && !isDndActive(potentialTime)) break;
+            }
             potentialTime.setTime(potentialTime.getTime() + 30 * 60 * 1000);
+            if (hasWindow && startMinutes !== null && endMinutes !== null) {
+              potentialTime = moveDateIntoTimeWindow(potentialTime, startMinutes, endMinutes);
+            }
         }
         times.push(potentialTime);
     }
     setTriggerTimesPreview(times);
-  };
+    return times;
+  }, [intervalType, notificationEndTime, notificationStartTime, quantity, reminderFrequency, scheduleAroundDnd]);
+
+  useEffect(() => {
+    if (reminderFrequency !== 'Continuous') {
+      void calculateTriggerTimesPreview();
+    }
+  }, [calculateTriggerTimesPreview, reminderFrequency]);
 
   const handleSave = async () => {
     if (!name.trim()) {
@@ -127,7 +173,7 @@ export default function CreateMinderScreen() {
     try {
         log.info(`Saving minder: ${name}`);
 
-        const numQuantity = parseInt(quantity, 10) || 1;
+        const numQuantity = quantity || 1;
         if (reminderFrequency === 'Daily' && numQuantity > 24) {
             Alert.alert('Error', 'Maximum daily triggers is 24.');
             setIsProcessing(false);
@@ -139,10 +185,10 @@ export default function CreateMinderScreen() {
             return;
         }
 
-        let triggerTimes = [];
+        let triggerTimes: { hours: number; minutes: number }[] = [];
         if (reminderFrequency !== 'Continuous' && intervalType === 'Equal') {
-            await calculateTriggerTimesPreview(); // Use the preview calculation
-            triggerTimes = triggerTimesPreview.map(t => ({ hours: t.getHours(), minutes: t.getMinutes() }));
+            const computed = await calculateTriggerTimesPreview(); // Use the preview calculation
+            triggerTimes = computed.map(t => ({ hours: t.getHours(), minutes: t.getMinutes() }));
         }
 
         const newMinder = {
@@ -155,6 +201,8 @@ export default function CreateMinderScreen() {
           scheduleAroundDnd,
           intervalType,
           triggerTimes, // Stored for Equal intervals
+          notificationStartTime,
+          notificationEndTime,
           successStreak: minderId ? undefined : 0,
         };
 
@@ -230,14 +278,52 @@ export default function CreateMinderScreen() {
         </View>
         {reminderFrequency !== 'Continuous' && (
             <>
-                <TextInput
-                    style={[styles.input, { color: colors.text, backgroundColor: colors.card, marginTop: 10 }]}
-                    placeholder="Times per day/week"
-                    placeholderTextColor={colors.text}
-                    value={quantity}
-                    onChangeText={setQuantity}
-                    keyboardType="numeric"
-                />
+                <View style={[styles.optionGroup, { justifyContent: 'space-between' }]}>
+                  <Text style={{ color: colors.text }}>Times per {reminderFrequency === 'Daily' ? 'day' : 'week'}:</Text>
+                  <View style={styles.sliderContainer}>
+                    {[1, 2, 3, 4, 5].map(v => (
+                      <TouchableOpacity
+                        key={v}
+                        onPress={() => setQuantity(v)}
+                        style={[
+                          styles.sliderStep,
+                          {
+                            backgroundColor: quantity === v ? colors.primary : colors.card,
+                            borderColor: colors.border,
+                          },
+                        ]}
+                      >
+                        <Text style={{ color: quantity === v ? 'white' : colors.text, fontWeight: '600' }}>{v}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+
+                <View style={[styles.optionGroup, { justifyContent: 'space-between' }]}>
+                  <Text style={{ color: colors.text }}>Notification window:</Text>
+                  <View style={styles.timeWindowContainer}>
+                    <TouchableOpacity
+                      style={[styles.timeButton, { backgroundColor: colors.card, borderColor: colors.border }]}
+                      onPress={() => {
+                        setTimePickerTarget('start');
+                        setTimePickerVisible(true);
+                      }}
+                    >
+                      <Text style={{ color: colors.text }}>{formatTimeLabel(notificationStartTime)}</Text>
+                    </TouchableOpacity>
+                    <Text style={{ color: colors.text, paddingHorizontal: 8 }}>to</Text>
+                    <TouchableOpacity
+                      style={[styles.timeButton, { backgroundColor: colors.card, borderColor: colors.border }]}
+                      onPress={() => {
+                        setTimePickerTarget('end');
+                        setTimePickerVisible(true);
+                      }}
+                    >
+                      <Text style={{ color: colors.text }}>{formatTimeLabel(notificationEndTime)}</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
                 <View style={[styles.optionGroup, {justifyContent: 'space-between'}]}>
                     <Text style={{ color: colors.text }}>Schedule around DND:</Text>
                     <Switch value={scheduleAroundDnd} onValueChange={setScheduleAroundDnd} />
@@ -252,7 +338,7 @@ export default function CreateMinderScreen() {
                     ))}
                     </View>
                 </View>
-                <View style={styles.triggerTimesContainer}>
+                <View style={[styles.triggerTimesContainer, { backgroundColor: colors.card }]}>
                     <Text style={{ color: colors.text, fontWeight: 'bold' }}>Upcoming Triggers Preview:</Text>
                     {triggerTimesPreview.map((time, index) => (
                         <Text key={index} style={{ color: colors.text }}>{time.toLocaleString()}</Text>
@@ -272,6 +358,59 @@ export default function CreateMinderScreen() {
             <Text style={styles.saveButtonText}>Save Minder</Text>
         </TouchableOpacity>
         </ScrollView>
+
+        <Modal
+          transparent
+          animationType="fade"
+          visible={timePickerVisible}
+          onRequestClose={() => setTimePickerVisible(false)}
+        >
+          <View style={styles.modalBackground}>
+            <TouchableOpacity
+              style={StyleSheet.absoluteFill}
+              activeOpacity={1}
+              onPress={() => setTimePickerVisible(false)}
+            />
+            <View style={[styles.timePickerCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+              <Text style={{ color: colors.text, fontSize: 16, fontWeight: '600', marginBottom: 12 }}>
+                Select {timePickerTarget === 'start' ? 'Start' : 'End'} Time
+              </Text>
+              <ScrollView style={{ maxHeight: 320 }}>
+                {buildTimeOptions().map(option => (
+                  <TouchableOpacity
+                    key={option}
+                    style={[
+                      styles.timeOption,
+                      {
+                        backgroundColor:
+                          (timePickerTarget === 'start' ? notificationStartTime : notificationEndTime) === option
+                            ? colors.primary
+                            : 'transparent',
+                      },
+                    ]}
+                    onPress={() => {
+                      if (timePickerTarget === 'start') setNotificationStartTime(option);
+                      else setNotificationEndTime(option);
+                      setTimePickerVisible(false);
+                    }}
+                  >
+                    <Text
+                      style={{
+                        color:
+                          (timePickerTarget === 'start' ? notificationStartTime : notificationEndTime) === option
+                            ? 'white'
+                            : colors.text,
+                        paddingVertical: 10,
+                      }}
+                    >
+                      {formatTimeLabel(option)}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            </View>
+          </View>
+        </Modal>
     </View>
   );
 }
@@ -291,6 +430,39 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     marginBottom: 16,
+  },
+  sliderContainer: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  sliderStep: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    minWidth: 36,
+    alignItems: 'center',
+  },
+  timeWindowContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  timeButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  timePickerCard: {
+    width: '80%',
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+  },
+  timeOption: {
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    marginBottom: 6,
   },
   colorContainer: {
     flexDirection: 'row',
@@ -328,7 +500,6 @@ const styles = StyleSheet.create({
   triggerTimesContainer: {
       marginTop: 16,
       padding: 10,
-      backgroundColor: '#f0f0f0',
       borderRadius: 5,
       marginBottom: 20,
   },
