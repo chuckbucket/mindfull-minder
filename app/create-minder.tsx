@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { View, Text, TextInput, StyleSheet, TouchableOpacity, Alert, Switch, ScrollView, Modal } from 'react-native';
+import { View, Text, TextInput, StyleSheet, TouchableOpacity, Alert, ScrollView, Modal } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../context/ThemeContext';
@@ -9,8 +9,6 @@ import { isWithinTimeWindow, moveDateIntoTimeWindow, parseClockTimeToMinutes } f
 import 'react-native-get-random-values';
 
 const MINDERS_STORAGE_KEY = '@minders';
-const DND_ENABLED_KEY = '@dndEnabled';
-const DND_SETTINGS_KEY = '@dndSettings';
 
 const colorsOptions = ['#FF6B6B', '#FFD166', '#06D6A0', '#118AB2', '#073B4C'];
 const frequencyOptions = ['Continuous', 'Daily', 'Weekly'];
@@ -46,7 +44,6 @@ export default function CreateMinderScreen() {
   const [reminderFrequency, setReminderFrequency] = useState(frequencyOptions[1]);
   const [quantity, setQuantity] = useState(1);
   const [note, setNote] = useState('');
-  const [scheduleAroundDnd, setScheduleAroundDnd] = useState(true);
   const [intervalType, setIntervalType] = useState(intervalOptions[0]);
   const [triggerTimesPreview, setTriggerTimesPreview] = useState<Date[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -75,7 +72,6 @@ export default function CreateMinderScreen() {
         setReminderFrequency(minderToEdit.reminderFrequency);
         setQuantity(typeof minderToEdit.quantity === 'number' ? minderToEdit.quantity : Number(minderToEdit.quantity) || 1);
         setNote(minderToEdit.note || '');
-        setScheduleAroundDnd(minderToEdit.scheduleAroundDnd || true);
         setIntervalType(minderToEdit.intervalType || intervalOptions[0]);
         setNotificationStartTime(minderToEdit.notificationStartTime || '08:00');
         setNotificationEndTime(minderToEdit.notificationEndTime || '20:00');
@@ -84,76 +80,56 @@ export default function CreateMinderScreen() {
   };
 
   const calculateTriggerTimesPreview = useCallback(async () => {
-    const dndSettingsEnabled = scheduleAroundDnd ? await AsyncStorage.getItem(DND_ENABLED_KEY) : null;
-    const dndSettings = scheduleAroundDnd ? await AsyncStorage.getItem(DND_SETTINGS_KEY) : null;
-    const enabled = dndSettingsEnabled ? JSON.parse(dndSettingsEnabled) : {};
-    const allSettings = dndSettings ? JSON.parse(dndSettings) : [];
-
-    const isDndActive = (time: Date) => {
-        if (!scheduleAroundDnd) return false;
-        const dayOfWeek = time.getDay();
-        const currentTime = time.getHours() * 60 + time.getMinutes();
-        for (const setting of allSettings) {
-            if (enabled[setting.id] && setting.days.includes(dayOfWeek)) {
-                const [startHour, startMinute] = setting.startTime.split(':').map(Number);
-                const [endHour, endMinute] = setting.endTime.split(':').map(Number);
-                const startTime = startHour * 60 + startMinute;
-                const endTime = endHour * 60 + endMinute;
-                if (startTime <= endTime) {
-                    if (currentTime >= startTime && currentTime <= endTime) return true;
-                } else {
-                    if (currentTime >= startTime || currentTime <= endTime) return true;
-                }
-            }
-        }
-        return false;
-    };
-
     const now = new Date();
     const times: Date[] = [];
     const totalQuantity = quantity || 1;
-
-    let interval, timeSpan;
-    if (reminderFrequency === 'Daily') {
-        timeSpan = 24 * 60 * 60 * 1000;
-    } else { // Weekly
-        timeSpan = 7 * 24 * 60 * 60 * 1000;
-    }
-    interval = timeSpan / totalQuantity;
 
     const startMinutes = parseClockTimeToMinutes(notificationStartTime);
     const endMinutes = parseClockTimeToMinutes(notificationEndTime);
     const hasWindow = startMinutes !== null && endMinutes !== null && startMinutes !== endMinutes;
 
-    for (let i = 0; i < totalQuantity; i++) {
-        let potentialTime = new Date(now.getTime() + i * interval);
-        if (intervalType === 'Random') {
-            const randomOffset = (Math.random() - 0.5) * 30 * 60 * 1000;
-            potentialTime.setTime(potentialTime.getTime() + randomOffset);
-        }
+    if (reminderFrequency === 'Daily' && hasWindow && startMinutes !== null && endMinutes !== null) {
+        const windowMs = endMinutes > startMinutes
+            ? (endMinutes - startMinutes) * 60 * 1000
+            : (24 * 60 - startMinutes + endMinutes) * 60 * 1000;
+        const spacing = totalQuantity > 1 ? windowMs / (totalQuantity - 1) : 0;
 
-        if (hasWindow && startMinutes !== null && endMinutes !== null) {
-          potentialTime = moveDateIntoTimeWindow(potentialTime, startMinutes, endMinutes);
-        }
+        const todayWindowStart = new Date(now);
+        todayWindowStart.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
 
-        while (
-          (hasWindow && startMinutes !== null && endMinutes !== null && !isWithinTimeWindow(potentialTime, startMinutes, endMinutes)) ||
-          isDndActive(potentialTime)
-        ) {
-            if (hasWindow && startMinutes !== null && endMinutes !== null) {
-              potentialTime = moveDateIntoTimeWindow(potentialTime, startMinutes, endMinutes);
-              if (isWithinTimeWindow(potentialTime, startMinutes, endMinutes) && !isDndActive(potentialTime)) break;
-            }
-            potentialTime.setTime(potentialTime.getTime() + 30 * 60 * 1000);
-            if (hasWindow && startMinutes !== null && endMinutes !== null) {
-              potentialTime = moveDateIntoTimeWindow(potentialTime, startMinutes, endMinutes);
+        for (let day = 0; times.length < totalQuantity && day <= 14; day++) {
+            const dayWindowStart = new Date(todayWindowStart.getTime() + day * 24 * 60 * 60 * 1000);
+            for (let i = 0; i < totalQuantity; i++) {
+                let t: Date;
+                if (intervalType === 'Random') {
+                    const randomOffset = (Math.random() - 0.5) * spacing * 0.6;
+                    t = moveDateIntoTimeWindow(new Date(dayWindowStart.getTime() + i * spacing + randomOffset), startMinutes, endMinutes);
+                } else {
+                    t = new Date(dayWindowStart.getTime() + i * spacing);
+                }
+                if (t > now) times.push(t);
+                if (times.length >= totalQuantity) break;
             }
         }
-        times.push(potentialTime);
+    } else {
+        const timeSpan = reminderFrequency === 'Daily' ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+        const interval = timeSpan / totalQuantity;
+        for (let i = 0; i < totalQuantity; i++) {
+            let potentialTime = new Date(now.getTime() + (i + 1) * interval);
+            if (intervalType === 'Random') {
+                const randomOffset = (Math.random() - 0.5) * 0.6 * interval;
+                potentialTime.setTime(potentialTime.getTime() + randomOffset);
+            }
+            if (hasWindow && startMinutes !== null && endMinutes !== null) {
+                potentialTime = moveDateIntoTimeWindow(potentialTime, startMinutes, endMinutes);
+            }
+            times.push(potentialTime);
+        }
     }
+
     setTriggerTimesPreview(times);
     return times;
-  }, [intervalType, notificationEndTime, notificationStartTime, quantity, reminderFrequency, scheduleAroundDnd]);
+  }, [intervalType, notificationEndTime, notificationStartTime, quantity, reminderFrequency]);
 
   useEffect(() => {
     if (reminderFrequency !== 'Continuous') {
@@ -198,7 +174,6 @@ export default function CreateMinderScreen() {
           reminderFrequency,
           quantity: numQuantity,
           note,
-          scheduleAroundDnd,
           intervalType,
           triggerTimes, // Stored for Equal intervals
           notificationStartTime,
@@ -324,10 +299,13 @@ export default function CreateMinderScreen() {
                   </View>
                 </View>
 
-                <View style={[styles.optionGroup, {justifyContent: 'space-between'}]}>
-                    <Text style={{ color: colors.text }}>Schedule around DND:</Text>
-                    <Switch value={scheduleAroundDnd} onValueChange={setScheduleAroundDnd} />
+                <View style={[styles.triggerTimesContainer, { backgroundColor: colors.card }]}>
+                    <Text style={{ color: colors.text, fontWeight: 'bold' }}>Upcoming Triggers Preview:</Text>
+                    {triggerTimesPreview.map((time, index) => (
+                        <Text key={index} style={{ color: colors.text }}>{time.toLocaleString()}</Text>
+                    ))}
                 </View>
+
                 <View style={styles.optionGroup}>
                     <Text style={{ color: colors.text }}>Interval Type:</Text>
                     <View style={styles.buttonContainer}>
@@ -337,12 +315,6 @@ export default function CreateMinderScreen() {
                         </TouchableOpacity>
                     ))}
                     </View>
-                </View>
-                <View style={[styles.triggerTimesContainer, { backgroundColor: colors.card }]}>
-                    <Text style={{ color: colors.text, fontWeight: 'bold' }}>Upcoming Triggers Preview:</Text>
-                    {triggerTimesPreview.map((time, index) => (
-                        <Text key={index} style={{ color: colors.text }}>{time.toLocaleString()}</Text>
-                    ))}
                 </View>
             </>
         )}

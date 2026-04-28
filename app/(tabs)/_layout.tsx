@@ -6,7 +6,7 @@ import { initializeLogging, logAppStartup } from '../../logic/Logger';
 import { version } from '../../package.json';
 
 export default function TabLayout() {
-  const { colors, isDarkMode } = useTheme();
+  const { colors } = useTheme();
 
   useEffect(() => {
     const startup = async () => {
@@ -35,6 +35,13 @@ export default function TabLayout() {
         options={{
           title: 'Minders',
           tabBarIcon: ({ color, size }) => <Ionicons name="list" size={size} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="history"
+        options={{
+          title: 'History',
+          tabBarIcon: ({ color, size }) => <Ionicons name="time-outline" size={size} color={color} />,
         }}
       />
       <Tabs.Screen

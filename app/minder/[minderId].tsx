@@ -58,7 +58,7 @@ export default function MinderHistoryScreen() {
     const missed: number[] = [];
     for (const notif of scheduled as any[]) {
       if (notif?.content?.data?.minderId !== minderId) continue;
-      const triggerDateValue = notif?.trigger?.date;
+      const triggerDateValue = notif?.trigger?.timestamp;
       if (!triggerDateValue) continue;
       const triggerAt = new Date(triggerDateValue).getTime();
       if (Number.isNaN(triggerAt) || triggerAt > now) continue;
@@ -98,7 +98,7 @@ export default function MinderHistoryScreen() {
       candidates.push(
         ...(scheduled as any[])
           .filter(n => n?.content?.data?.minderId === minderId)
-          .map(n => n?.trigger?.date)
+          .map(n => n?.trigger?.timestamp)
           .filter(Boolean)
           .map((d: any) => new Date(d).getTime())
           .filter((t: any) => typeof t === 'number' && !Number.isNaN(t)),

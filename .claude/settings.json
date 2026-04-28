@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.\\(tsx|ts\\)$\")",
+      "Bash(python3 -c \"import sys,json;d=json.load\\(sys.stdin\\);print\\('version:',d.get\\('version'\\)\\);print\\('main:',d.get\\('main'\\)\\);print\\('types:',d.get\\('types'\\)\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(npx tsc *)"
+    ]
+  }
+}

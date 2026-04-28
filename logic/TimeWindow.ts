@@ -1,4 +1,4 @@
-const TIME_RE = /^([01]\\d|2[0-3]):([0-5]\\d)$/;
+const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 export const parseClockTimeToMinutes = (time: string): number | null => {
   const match = TIME_RE.exec(time);

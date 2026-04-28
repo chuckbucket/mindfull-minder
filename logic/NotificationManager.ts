@@ -1,51 +1,20 @@
 import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Alert } from 'react-native';
+import { Alert, AppState } from 'react-native';
 import { log } from './Logger';
 import { isWithinTimeWindow, moveDateIntoTimeWindow, parseClockTimeToMinutes } from './TimeWindow';
 
 const MINDERS_STORAGE_KEY = '@minders';
-const DND_ENABLED_KEY = '@dndEnabled';
-const DND_SETTINGS_KEY = '@dndSettings';
 const IOS_NOTIFICATION_LIMIT = 64;
-
-// Helper to check if a given time falls within a DND period
-const isDndActive = async (time: Date) => {
-    const dndEnabled = await AsyncStorage.getItem(DND_ENABLED_KEY);
-    if (!dndEnabled || dndEnabled !== 'true') return false;
-
-    const dndSettings = await AsyncStorage.getItem(DND_SETTINGS_KEY);
-    if (!dndSettings) return false;
-
-    const allSettings = JSON.parse(dndSettings);
-    const enabledSettings = await AsyncStorage.getItem(DND_ENABLED_KEY);
-    const enabled = enabledSettings ? JSON.parse(enabledSettings) : {};
-
-    const dayOfWeek = time.getDay();
-    const currentTime = time.getHours() * 60 + time.getMinutes();
-
-    for (const setting of allSettings) {
-        if (enabled[setting.id] && setting.days.includes(dayOfWeek)) {
-            const [startHour, startMinute] = setting.startTime.split(':').map(Number);
-            const [endHour, endMinute] = setting.endTime.split(':').map(Number);
-            const startTime = startHour * 60 + startMinute;
-            const endTime = endHour * 60 + endMinute;
-            if (startTime <= endTime) {
-                if (currentTime >= startTime && currentTime <= endTime) return true;
-            } else { // Overnight case
-                if (currentTime >= startTime || currentTime <= endTime) return true;
-            }
-        }
-    }
-    return false;
-};
 
 export const scheduleNotificationsForAllMinders = async () => {
     log.info('Scheduling notifications for all minders...');
     const { status } = await Notifications.requestPermissionsAsync();
     if (status !== 'granted') {
         log.error('Notification permissions are not granted.');
-        Alert.alert('Error', 'Notification permissions are not granted.');
+        if (AppState.currentState === 'active') {
+            Alert.alert('Error', 'Notification permissions are not granted.');
+        }
         return;
     }
 
@@ -80,7 +49,7 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
     }
 
     const now = new Date();
-    const scheduleUntil = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); // Schedule up to 7 days
+    const scheduleUntil = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000); // 3-day rolling window; background task keeps it fresh
     let newNotificationTimes: Date[] = [];
 
     const timeSpan = (minderData.reminderFrequency === 'Daily' ? 24 : 7 * 24) * 60 * 60 * 1000;
@@ -90,45 +59,54 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
     const endMinutes = typeof minderData.notificationEndTime === 'string' ? parseClockTimeToMinutes(minderData.notificationEndTime) : null;
     const hasWindow = startMinutes !== null && endMinutes !== null && startMinutes !== endMinutes;
 
-    let currentTime = now.getTime();
+    if (minderData.reminderFrequency === 'Daily' && hasWindow && startMinutes !== null && endMinutes !== null) {
+        const windowMs = endMinutes > startMinutes
+            ? (endMinutes - startMinutes) * 60 * 1000
+            : (24 * 60 - startMinutes + endMinutes) * 60 * 1000;
+        const spacing = minderData.quantity > 1 ? windowMs / (minderData.quantity - 1) : 0;
 
-    while (currentTime < scheduleUntil.getTime() && newNotificationTimes.length < availableSlots) {
-        let nextTime = new Date(currentTime + interval);
+        const todayWindowStart = new Date(now);
+        todayWindowStart.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
 
-        if (minderData.intervalType === 'Random') {
-            const randomOffset = (Math.random() - 0.5) * (interval / 2);
-            nextTime.setTime(nextTime.getTime() + randomOffset);
+        for (let day = 0; newNotificationTimes.length < availableSlots; day++) {
+            const dayWindowStart = new Date(todayWindowStart.getTime() + day * 24 * 60 * 60 * 1000);
+            if (dayWindowStart >= scheduleUntil) break;
+
+            for (let i = 0; i < minderData.quantity && newNotificationTimes.length < availableSlots; i++) {
+                let t: Date;
+                if (minderData.intervalType === 'Random') {
+                    const randomOffset = (Math.random() - 0.5) * spacing * 0.6;
+                    t = moveDateIntoTimeWindow(new Date(dayWindowStart.getTime() + i * spacing + randomOffset), startMinutes, endMinutes);
+                } else {
+                    t = new Date(dayWindowStart.getTime() + i * spacing);
+                }
+                if (t > now && t < scheduleUntil) {
+                    newNotificationTimes.push(t);
+                }
+            }
         }
+    } else {
+        let currentTime = now.getTime();
+        while (currentTime < scheduleUntil.getTime() && newNotificationTimes.length < availableSlots) {
+            let nextTime = new Date(currentTime + interval);
 
-        if (hasWindow && startMinutes !== null && endMinutes !== null) {
-            nextTime = moveDateIntoTimeWindow(nextTime, startMinutes, endMinutes);
-        }
+            if (minderData.intervalType === 'Random') {
+                const randomOffset = (Math.random() - 0.5) * 0.6 * interval;
+                nextTime.setTime(nextTime.getTime() + randomOffset);
+            }
 
-        while (nextTime < scheduleUntil) {
             if (hasWindow && startMinutes !== null && endMinutes !== null && !isWithinTimeWindow(nextTime, startMinutes, endMinutes)) {
                 nextTime = moveDateIntoTimeWindow(nextTime, startMinutes, endMinutes);
-                continue;
             }
 
-            if (minderData.scheduleAroundDnd && (await isDndActive(nextTime))) {
-                log.debug(`DND active at ${nextTime}, postponing notification.`);
-                nextTime.setTime(nextTime.getTime() + 30 * 60 * 1000);
-                if (hasWindow && startMinutes !== null && endMinutes !== null) {
-                    nextTime = moveDateIntoTimeWindow(nextTime, startMinutes, endMinutes);
+            if (nextTime < scheduleUntil && nextTime > now) {
+                const isAlreadyScheduled = newNotificationTimes.some(t => Math.abs(t.getTime() - nextTime.getTime()) < 60000);
+                if (!isAlreadyScheduled) {
+                    newNotificationTimes.push(nextTime);
                 }
-                continue;
             }
-
-            break;
+            currentTime = nextTime.getTime();
         }
-
-        if (nextTime < scheduleUntil && nextTime > now) {
-            const isAlreadyScheduled = newNotificationTimes.some(t => Math.abs(t.getTime() - nextTime.getTime()) < 60000); // 1 minute tolerance
-            if (!isAlreadyScheduled) {
-                newNotificationTimes.push(nextTime);
-            }
-        }
-        currentTime = nextTime.getTime();
     }
 
     log.info(`Calculated ${newNotificationTimes.length} notification times. ${availableSlots} slots were available.`);
@@ -144,6 +122,7 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
                     body: 'Reminder',
                     data: { minderId: minderData.id, minderName: minderData.name },
                     categoryIdentifier: 'MINDER_REMINDER',
+                    sticky: true,
                 },
                 trigger: {
                     type: Notifications.SchedulableTriggerInputTypes.DATE,
