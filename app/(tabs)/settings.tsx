@@ -8,12 +8,12 @@ import * as Updates from 'expo-updates';
 import { useTheme } from '../../context/ThemeContext';
 import { themes } from '../../styles/themes';
 import { setLogLevel, getLogs } from '../../logic/Logger';
+import { getAllMinderEvents } from '../../logic/MinderEvents';
 import { scheduleNotificationsForAllMinders } from '../../logic/NotificationManager';
 import { CHANGELOG, type ChangelogBullet } from '../../constants/changelog';
 
 const LOG_LEVEL_KEY = '@logLevel';
 const MINDERS_KEY = '@minders';
-const EVENTS_KEY = '@minderEvents';
 const QUIET_HOURS_KEY = '@quietHours';
 
 const TIME_OPTIONS: string[] = [];
@@ -148,12 +148,12 @@ export default function SettingsScreen() {
   const handleExport = async () => {
     try {
       const mindersRaw = await AsyncStorage.getItem(MINDERS_KEY);
-      const eventsRaw = await AsyncStorage.getItem(EVENTS_KEY);
+      const events = await getAllMinderEvents();
       const exportData = {
         exportedAt: new Date().toISOString(),
         appVersion: '1.0.0',
         minders: mindersRaw ? JSON.parse(mindersRaw) : [],
-        events: eventsRaw ? JSON.parse(eventsRaw) : [],
+        events,
       };
       await Share.share({
         message: JSON.stringify(exportData, null, 2),

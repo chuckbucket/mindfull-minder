@@ -1,6 +1,4 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
-
-const EVENTS_STORAGE_KEY = '@minderEvents';
+import * as SQLite from 'expo-sqlite';
 
 // 'note' is legacy; normalize to 'log' on read.
 export type MinderEventKind = 'log' | 'note' | 'completed' | 'missed' | 'triggered';
@@ -16,89 +14,91 @@ export type MinderEvent = {
   mood?: Mood;
 };
 
-const normalizeEvent = (event: any): MinderEvent | null => {
-  if (!event || typeof event !== 'object') return null;
-  if (typeof event.id !== 'string') return null;
-  if (typeof event.minderId !== 'string') return null;
-  if (typeof event.kind !== 'string') return null;
-  if (typeof event.at !== 'number') return null;
-
-  const kind = event.kind === 'note' ? 'log' : event.kind;
-  if (kind !== 'log' && kind !== 'completed' && kind !== 'missed' && kind !== 'triggered') return null;
-
-  const mood = event.mood;
-  const normalizedMood: Mood | undefined =
-    mood === 'good' || mood === 'neutral' || mood === 'bad' ? (mood as Mood) : undefined;
-
-  return {
-    id: event.id,
-    minderId: event.minderId,
-    kind,
-    at: event.at,
-    text: typeof event.text === 'string' ? event.text : undefined,
-    triggerAt: typeof event.triggerAt === 'number' ? event.triggerAt : undefined,
-    mood: normalizedMood,
-  };
+type EventRow = {
+  id: string;
+  minderId: string;
+  kind: string;
+  at: number;
+  text: string | null;
+  triggerAt: number | null;
+  mood: string | null;
 };
 
-const readAll = async (): Promise<MinderEvent[]> => {
-  const raw = await AsyncStorage.getItem(EVENTS_STORAGE_KEY);
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.map(normalizeEvent).filter(Boolean) as MinderEvent[];
-  } catch {
-    return [];
-  }
+let _db: SQLite.SQLiteDatabase | null = null;
+
+const getDb = async (): Promise<SQLite.SQLiteDatabase> => {
+  if (_db) return _db;
+  _db = await SQLite.openDatabaseAsync('mindfull_minder.db');
+  await _db.execAsync(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS minder_events (
+      id TEXT PRIMARY KEY,
+      minderId TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      at INTEGER NOT NULL,
+      text TEXT,
+      triggerAt INTEGER,
+      mood TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_me_minder ON minder_events (minderId);
+    CREATE INDEX IF NOT EXISTS idx_me_at ON minder_events (at);
+  `);
+  return _db;
 };
 
-const writeAll = async (events: MinderEvent[]) => {
-  await AsyncStorage.setItem(EVENTS_STORAGE_KEY, JSON.stringify(events));
+const rowToEvent = (row: EventRow): MinderEvent => ({
+  id: row.id,
+  minderId: row.minderId,
+  kind: row.kind === 'note' ? 'log' : (row.kind as MinderEventKind),
+  at: row.at,
+  text: row.text ?? undefined,
+  triggerAt: row.triggerAt ?? undefined,
+  mood: (row.mood as Mood | null) ?? undefined,
+});
+
+export const getAllMinderEvents = async (): Promise<MinderEvent[]> => {
+  const db = await getDb();
+  const rows = await db.getAllAsync<EventRow>('SELECT * FROM minder_events ORDER BY at DESC');
+  return rows.map(rowToEvent);
 };
 
-export const getAllMinderEvents = async () => readAll();
-
-export const getEventsForMinder = async (minderId: string) => {
-  const all = await readAll();
-  return all.filter(e => e.minderId === minderId).sort((a, b) => b.at - a.at);
+export const getEventsForMinder = async (minderId: string): Promise<MinderEvent[]> => {
+  const db = await getDb();
+  const rows = await db.getAllAsync<EventRow>(
+    'SELECT * FROM minder_events WHERE minderId = ? ORDER BY at DESC',
+    minderId,
+  );
+  return rows.map(rowToEvent);
 };
 
-export const addMinderEvent = async (event: Omit<MinderEvent, 'id'> & { id?: string }) => {
-  const all = await readAll();
-  const id = event.id || `${Date.now()}-${Math.random()}`;
-  if (event.id && all.some(e => e.id === id)) return id;
-  all.push({ ...event, id });
-  await writeAll(all);
+export const addMinderEvent = async (event: Omit<MinderEvent, 'id'> & { id?: string }): Promise<string> => {
+  const db = await getDb();
+  const id = event.id ?? `${Date.now()}-${Math.random()}`;
+  await db.runAsync(
+    'INSERT OR IGNORE INTO minder_events (id, minderId, kind, at, text, triggerAt, mood) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    id, event.minderId, event.kind, event.at, event.text ?? null, event.triggerAt ?? null, event.mood ?? null,
+  );
   return id;
 };
 
-export const deleteEventsForMinder = async (minderId: string) => {
-  const all = await readAll();
-  await writeAll(all.filter(e => e.minderId !== minderId));
+export const deleteEventsForMinder = async (minderId: string): Promise<void> => {
+  const db = await getDb();
+  await db.runAsync('DELETE FROM minder_events WHERE minderId = ?', minderId);
 };
 
-export const upsertMissedEvents = async (minderId: string, triggerAts: number[]) => {
-  const all = await readAll();
-  const existing = new Set(
-    all.filter(e => e.minderId === minderId && e.kind === 'missed' && typeof e.triggerAt === 'number').map(e => e.id),
-  );
-
-  let changed = false;
+export const upsertMissedEvents = async (minderId: string, triggerAts: number[]): Promise<void> => {
+  if (triggerAts.length === 0) return;
+  const db = await getDb();
   for (const triggerAt of triggerAts) {
     const id = `missed:${minderId}:${triggerAt}`;
-    if (existing.has(id)) continue;
-    all.push({
-      id,
-      minderId,
-      kind: 'missed',
-      at: triggerAt,
-      triggerAt,
-    });
-    changed = true;
+    await db.runAsync(
+      'INSERT OR IGNORE INTO minder_events (id, minderId, kind, at, text, triggerAt, mood) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      id, minderId, 'missed', triggerAt, null, triggerAt, null,
+    );
   }
+};
 
-  if (changed) {
-    await writeAll(all);
-  }
+export const clearAllMinderEvents = async (): Promise<void> => {
+  const db = await getDb();
+  await db.runAsync('DELETE FROM minder_events');
 };
