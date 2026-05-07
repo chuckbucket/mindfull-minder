@@ -1,22 +1,59 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ScrollView,
   SectionList,
   SectionListData,
   StyleSheet,
   Text,
+  TouchableOpacity,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useFocusEffect } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../context/ThemeContext';
-import { getAllMinderEvents, MinderEvent } from '../../logic/MinderEvents';
+import { addMinderEvent, getAllMinderEvents, MinderEvent } from '../../logic/MinderEvents';
 
 const MINDERS_STORAGE_KEY = '@minders';
 
 type Minder = { id: string; name: string; color: string; reminderFrequency: string };
+
+type MinderStats = {
+  minder: Minder;
+  completionRate: number | null;
+  streak: number;
+  totalCompleted: number;
+};
+
+const toDateKey = (ms: number) => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+function computeMinderStats(minder: Minder, events: MinderEvent[]): MinderStats {
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const recent = events.filter(e => e.at >= sevenDaysAgo);
+  const recentCompleted = recent.filter(e => e.kind === 'completed').length;
+  const recentMissed = recent.filter(e => e.kind === 'missed').length;
+  const total = recentCompleted + recentMissed;
+  const completionRate = total > 0 ? Math.round((recentCompleted / total) * 100) : null;
+  const totalCompleted = events.filter(e => e.kind === 'completed').length;
+
+  const completionDayKeys = new Set(
+    events.filter(e => e.kind === 'completed').map(e => toDateKey(e.at)),
+  );
+  const todayKey = toDateKey(Date.now());
+  let streak = 0;
+  const startDay = completionDayKeys.has(todayKey) ? 0 : 1;
+  for (let i = startDay; i < 365; i++) {
+    if (completionDayKeys.has(toDateKey(Date.now() - i * 86400000))) streak++;
+    else break;
+  }
+
+  return { minder, completionRate, streak, totalCompleted };
+}
 
 type ScheduledItem = {
   type: 'scheduled';
@@ -84,10 +121,11 @@ const kindIconSpec = (kind: MinderEvent['kind']): IconSpec => {
 
 export default function HistoryScreen() {
   const { colors } = useTheme();
+  const router = useRouter();
   const [sections, setSections] = useState<TimelineSection[]>([]);
+  const [minderStats, setMinderStats] = useState<MinderStats[]>([]);
   const listRef = useRef<SectionList<TimelineItem, TimelineSection>>(null);
   const scrollTarget = useRef<{ sectionIndex: number; itemIndex: number } | null>(null);
-  const didScroll = useRef(false);
 
   const buildSections = useCallback(async () => {
     const now = Date.now();
@@ -98,42 +136,94 @@ export default function HistoryScreen() {
     const minderMap = new Map(minders.map(m => [m.id, m]));
 
     const dayMap = new Map<string, TimelineItem[]>();
+    const cutoff45 = now + 45 * 24 * 60 * 60 * 1000;
 
     const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+    type HolidayRaw = { item: ScheduledItem; daysRemaining: number; time: number };
+    const holidayGroups = new Map<string, HolidayRaw[]>();
+
     for (const notif of scheduled) {
-      const minderId = (notif.content.data as any)?.minderId as string | undefined;
-      if (!minderId) continue;
+      const data = notif.content.data as any;
+      const minderId = data?.minderId as string | undefined;
+      const isHoliday = data?.notificationType === 'holiday';
+      if (!minderId && !isHoliday) continue;
       const t = notif.trigger as any;
       const raw = t?.value ?? t?.timestamp ?? t?.date;
       if (!raw) continue;
       const time = typeof raw === 'number' ? raw : new Date(raw).getTime();
-      if (isNaN(time)) continue;
-      const dateKey = toLocalDateKey(time);
-      const minder = minderMap.get(minderId);
-      const bucket = dayMap.get(dateKey) ?? [];
-      bucket.push({
-        type: 'scheduled',
-        time,
-        minderId,
-        minderName: minder?.name ?? 'Unknown',
-        minderColor: minder?.color ?? '#888',
-        id: notif.identifier,
-      });
-      dayMap.set(dateKey, bucket);
+      if (isNaN(time) || time > cutoff45) continue;
+
+      if (isHoliday) {
+        const holidayId = data.holidayId ?? 'unknown';
+        const item: ScheduledItem = {
+          type: 'scheduled',
+          time,
+          minderId: `holiday:${holidayId}`,
+          minderName: notif.content.title ?? 'Holiday Reminder',
+          minderColor: '#E91E63',
+          id: notif.identifier,
+        };
+        const group = holidayGroups.get(holidayId) ?? [];
+        group.push({ item, daysRemaining: (data.daysRemaining as number) ?? -1, time });
+        holidayGroups.set(holidayId, group);
+      } else {
+        const minder = minderMap.get(minderId!);
+        const dateKey = toLocalDateKey(time);
+        const bucket = dayMap.get(dateKey) ?? [];
+        bucket.push({
+          type: 'scheduled',
+          time,
+          minderId: minderId!,
+          minderName: minder?.name ?? 'Unknown',
+          minderColor: minder?.color ?? '#888',
+          id: notif.identifier,
+        });
+        dayMap.set(dateKey, bucket);
+      }
+    }
+
+    // Per holiday: show only the event-day notification (daysRemaining===0) + the nearest upcoming reminder
+    for (const [, raws] of holidayGroups) {
+      const eventDay = raws.find(r => r.daysRemaining === 0);
+      const upcoming = raws
+        .filter(r => r.daysRemaining > 0 && r.time > now)
+        .sort((a, b) => a.time - b.time)[0];
+      for (const raw of [eventDay, upcoming]) {
+        if (!raw) continue;
+        const dateKey = toLocalDateKey(raw.time);
+        const bucket = dayMap.get(dateKey) ?? [];
+        bucket.push(raw.item);
+        dayMap.set(dateKey, bucket);
+      }
     }
 
     const allEvents = await getAllMinderEvents();
+
+    // Compute per-minder stats for the dashboard
+    const statsByMinder = new Map<string, MinderEvent[]>();
+    for (const event of allEvents) {
+      if (event.minderId === '__global__') continue;
+      const list = statsByMinder.get(event.minderId) ?? [];
+      list.push(event);
+      statsByMinder.set(event.minderId, list);
+    }
+    const stats: MinderStats[] = minders.map(m =>
+      computeMinderStats(m, statsByMinder.get(m.id) ?? []),
+    );
+    setMinderStats(stats);
+
     for (const event of allEvents) {
       if (event.kind === 'triggered') continue;
       const time = event.triggerAt ?? event.at;
       const dateKey = toLocalDateKey(time);
-      const minder = minderMap.get(event.minderId);
+      const isGlobal = event.minderId === '__global__';
+      const minder = isGlobal ? undefined : minderMap.get(event.minderId);
       const bucket = dayMap.get(dateKey) ?? [];
       bucket.push({
         type: 'event',
         event,
-        minderName: minder?.name ?? 'Unknown',
-        minderColor: minder?.color ?? '#888',
+        minderName: isGlobal ? 'Quick Check-in' : (minder?.name ?? 'Unknown'),
+        minderColor: isGlobal ? '#9C27B0' : (minder?.color ?? '#888'),
       });
       dayMap.set(dateKey, bucket);
     }
@@ -159,7 +249,6 @@ export default function HistoryScreen() {
     if (todaySectionIdx >= 0 && nowItemIdx >= 0) {
       scrollTarget.current = { sectionIndex: todaySectionIdx, itemIndex: nowItemIdx };
     }
-    didScroll.current = false;
     setSections(result);
   }, []);
 
@@ -169,11 +258,10 @@ export default function HistoryScreen() {
     }, [buildSections]),
   );
 
-  const handleLayout = useCallback(() => {
-    if (didScroll.current || !scrollTarget.current) return;
-    didScroll.current = true;
+  useEffect(() => {
+    if (!scrollTarget.current) return;
     const { sectionIndex, itemIndex } = scrollTarget.current;
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       try {
         listRef.current?.scrollToLocation({
           sectionIndex,
@@ -184,8 +272,79 @@ export default function HistoryScreen() {
       } catch {
         // ignore if items not yet measured
       }
-    }, 80);
-  }, []);
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [sections]);
+
+  const handleRetroComplete = async (event: MinderEvent) => {
+    const triggerAt = event.triggerAt ?? event.at;
+    await addMinderEvent({
+      id: `completed:${event.minderId}:${triggerAt}`,
+      minderId: event.minderId,
+      kind: 'completed',
+      at: Date.now(),
+      triggerAt,
+    });
+    void buildSections();
+  };
+
+  const renderDashboard = () => {
+    if (minderStats.length === 0) return null;
+    const totalCompleted = minderStats.reduce((s, m) => s + m.totalCompleted, 0);
+    const rates = minderStats.map(m => m.completionRate).filter((r): r is number => r !== null);
+    const avgRate = rates.length > 0 ? Math.round(rates.reduce((a, b) => a + b, 0) / rates.length) : null;
+    const bestStreak = Math.max(...minderStats.map(m => m.streak), 0);
+
+    return (
+      <View style={[styles.dashboard, { backgroundColor: colors.background, borderBottomColor: colors.border }]}>
+        <View style={styles.overallRow}>
+          <View style={styles.overallPill}>
+            <Text style={[styles.overallPillValue, { color: colors.primary }]}>{totalCompleted}</Text>
+            <Text style={[styles.overallPillLabel, { color: colors.text }]}>done</Text>
+          </View>
+          <View style={[styles.pillDivider, { backgroundColor: colors.border }]} />
+          <View style={styles.overallPill}>
+            <Text style={[styles.overallPillValue, { color: colors.primary }]}>
+              {avgRate !== null ? `${avgRate}%` : '—'}
+            </Text>
+            <Text style={[styles.overallPillLabel, { color: colors.text }]}>avg week</Text>
+          </View>
+          <View style={[styles.pillDivider, { backgroundColor: colors.border }]} />
+          <View style={styles.overallPill}>
+            <Text style={[styles.overallPillValue, { color: colors.primary }]}>{bestStreak}d</Text>
+            <Text style={[styles.overallPillLabel, { color: colors.text }]}>best streak</Text>
+          </View>
+        </View>
+
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipScroll}>
+          {minderStats.map(({ minder, completionRate, streak }) => (
+            <TouchableOpacity
+              key={minder.id}
+              style={[styles.minderChip, { backgroundColor: colors.card, borderColor: colors.border }]}
+              onPress={() => router.push(`/minder/${minder.id}`)}
+              accessibilityLabel={`View stats for ${minder.name}`}
+              accessibilityRole="button"
+            >
+              <View style={[styles.chipBar, { backgroundColor: minder.color }]} />
+              <View style={styles.chipContent}>
+                <Text style={[styles.chipName, { color: colors.text }]} numberOfLines={1}>
+                  {minder.name}
+                </Text>
+                <View style={styles.chipStats}>
+                  <Text style={[styles.chipRate, { color: colors.primary }]}>
+                    {completionRate !== null ? `${completionRate}%` : '—'}
+                  </Text>
+                  {streak > 0 && (
+                    <Text style={[styles.chipStreak, { color: colors.text }]}>🔥{streak}d</Text>
+                  )}
+                </View>
+              </View>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+      </View>
+    );
+  };
 
   const renderNowMarker = (item: NowItem) => (
     <View style={styles.nowRow}>
@@ -223,6 +382,7 @@ export default function HistoryScreen() {
   const renderEvent = (item: EventItem) => {
     const { name: iconName, color: iconColor } = kindIconSpec(item.event.kind);
     const time = item.event.triggerAt ?? item.event.at;
+    const isMissed = item.event.kind === 'missed';
     return (
       <View style={styles.itemRow}>
         <View style={styles.timeCol}>
@@ -259,12 +419,29 @@ export default function HistoryScreen() {
                     ? '😊 Good'
                     : item.event.mood === 'neutral'
                       ? '😐 Neutral'
-                      : '😟 Bad'}
+                      : '😟 Not great'}
                 </Text>
               )}
               {!!item.event.text && (
                 <Text style={[styles.logText, { color: colors.text }]}>{item.event.text}</Text>
               )}
+            </View>
+          )}
+          {isMissed && (
+            <View style={styles.missedFooter}>
+              <Text style={[styles.gentleText, { color: colors.text }]}>
+                That's okay — every moment is a fresh start. 🌱
+              </Text>
+              <TouchableOpacity
+                style={[styles.retroButton, { backgroundColor: `${colors.primary}22`, borderColor: colors.primary }]}
+                onPress={() => handleRetroComplete(item.event)}
+                accessibilityLabel="Mark this reminder as done retroactively"
+                accessibilityRole="button"
+              >
+                <Text style={[styles.retroButtonText, { color: colors.primary }]}>
+                  I actually did it ✓
+                </Text>
+              </TouchableOpacity>
             </View>
           )}
         </View>
@@ -299,6 +476,7 @@ export default function HistoryScreen() {
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]} edges={['bottom']}>
+      {renderDashboard()}
       <SectionList
         ref={listRef}
         sections={sections}
@@ -311,7 +489,6 @@ export default function HistoryScreen() {
         renderSectionHeader={renderSectionHeader}
         stickySectionHeadersEnabled
         contentContainerStyle={styles.listContent}
-        onLayout={handleLayout}
         ListEmptyComponent={
           <View style={styles.emptyContainer}>
             <Ionicons name="time-outline" size={40} color={colors.text} style={{ opacity: 0.3 }} />
@@ -403,4 +580,53 @@ const styles = StyleSheet.create({
   cardBody: { marginTop: 6, gap: 3 },
   moodText: { fontSize: 12, opacity: 0.75 },
   logText: { fontSize: 13, lineHeight: 19 },
+
+  missedFooter: {
+    marginTop: 10,
+    gap: 8,
+  },
+  gentleText: {
+    fontSize: 12,
+    opacity: 0.65,
+    fontStyle: 'italic',
+  },
+  retroButton: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  retroButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  dashboard: {
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    gap: 8,
+  },
+  overallRow: { flexDirection: 'row', alignItems: 'center' },
+  overallPill: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4 },
+  overallPillValue: { fontSize: 15, fontWeight: '800' },
+  overallPillLabel: { fontSize: 11, opacity: 0.55 },
+  pillDivider: { width: 1, height: 18, marginHorizontal: 6 },
+  chipScroll: { gap: 8 },
+  minderChip: {
+    flexDirection: 'row',
+    borderWidth: 1,
+    borderRadius: 10,
+    overflow: 'hidden',
+    width: 120,
+    height: 50,
+  },
+  chipBar: { width: 4 },
+  chipContent: { flex: 1, paddingHorizontal: 8, paddingVertical: 6, justifyContent: 'space-between' },
+  chipName: { fontSize: 11, fontWeight: '700' },
+  chipStats: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  chipRate: { fontSize: 15, fontWeight: '800' },
+  chipStreak: { fontSize: 10, opacity: 0.65 },
 });

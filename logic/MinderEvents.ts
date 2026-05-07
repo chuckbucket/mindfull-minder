@@ -73,6 +73,11 @@ export const addMinderEvent = async (event: Omit<MinderEvent, 'id'> & { id?: str
   return id;
 };
 
+export const deleteEventsForMinder = async (minderId: string) => {
+  const all = await readAll();
+  await writeAll(all.filter(e => e.minderId !== minderId));
+};
+
 export const upsertMissedEvents = async (minderId: string, triggerAts: number[]) => {
   const all = await readAll();
   const existing = new Set(

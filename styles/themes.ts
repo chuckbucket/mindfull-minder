@@ -41,12 +41,12 @@ export const DarkTheme = {
 export const PastelTheme = {
   dark: false,
   colors: {
-    primary: '#FFB6C1', // Light Pink
+    primary: '#9B8FC9', // Soft lavender-purple
     background: '#F5F5DC', // Beige
     card: '#FFF0F5', // Lavender Blush
     text: '#778899', // Light Slate Gray
     border: '#D3D3D3', // Light Gray
-    notification: '#FFC0CB',
+    notification: '#9B8FC9',
     palette: {
       blue: '#ADD8E6', // Light Blue
       orange: '#FFDAB9', // Peach Puff

@@ -34,7 +34,15 @@ export default function TabLayout() {
         name="index"
         options={{
           title: 'Minders',
+          headerShown: false,
           tabBarIcon: ({ color, size }) => <Ionicons name="list" size={size} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="checkin"
+        options={{
+          title: 'Check In',
+          tabBarIcon: ({ color, size }) => <Ionicons name="heart-outline" size={size} color={color} />,
         }}
       />
       <Tabs.Screen

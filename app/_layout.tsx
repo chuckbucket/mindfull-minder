@@ -1,13 +1,16 @@
 import FontAwesome from '@expo/vector-icons/FontAwesome';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFonts } from 'expo-font';
 import * as Notifications from 'expo-notifications';
 import { Stack, useRouter } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import { useEffect } from 'react';
 import { ThemeProvider } from '../context/ThemeContext';
-import { addMinderEvent } from '../logic/MinderEvents';
+import { ErrorBoundary } from '../components/ErrorBoundary';
+import { addMinderEvent, getAllMinderEvents } from '../logic/MinderEvents';
 import '../logic/BackgroundTaskManager';
 import { registerBackgroundFetchTask } from '../logic/BackgroundTaskManager';
+import { scheduleHolidayNotifications } from '../logic/HolidayManager';
 
 export {
   // Catch any errors thrown by the Layout component.
@@ -42,29 +45,37 @@ export default function RootLayout() {
     if (error) throw error;
   }, [error]);
 
-  useEffect(() => {
-    if (loaded) {
-      SplashScreen.hideAsync();
-    }
-  }, [loaded]);
-
+  // Splash is hidden by RootLayoutNav after the onboarding check completes,
+  // so there is no flash of the home screen before the redirect fires.
   if (!loaded) {
     return null;
   }
 
-  return <RootLayoutNav />;
+  return (
+    <ErrorBoundary>
+      <RootLayoutNav />
+    </ErrorBoundary>
+  );
 }
 
 function RootLayoutNav() {
   const router = useRouter();
 
   useEffect(() => {
+    // Check onboarding before hiding the splash screen to prevent a flash of the home screen.
+    const checkOnboarding = async () => {
+      try {
+        const value = await AsyncStorage.getItem('@hasSeenOnboarding');
+        if (!value) {
+          router.replace('/onboarding');
+        }
+      } finally {
+        SplashScreen.hideAsync();
+      }
+    };
+    void checkOnboarding();
+
     void Notifications.setNotificationCategoryAsync('MINDER_REMINDER', [
-      {
-        identifier: 'SNOOZE_15_MIN',
-        buttonTitle: 'Snooze 15m',
-        options: { opensAppToForeground: false },
-      },
       {
         identifier: 'COMPLETE',
         buttonTitle: 'Mark Complete',
@@ -93,27 +104,7 @@ function RootLayoutNav() {
 
       const triggerDateValue = (response.notification.request.trigger as any)?.date;
       const triggerAt = triggerDateValue ? new Date(triggerDateValue).getTime() : undefined;
-      const minderName = (response.notification.request.content.data as any)?.minderName;
       const at = Date.now();
-
-      if (response.actionIdentifier === 'SNOOZE_15_MIN') {
-        const snoozeAt = new Date(Date.now() + 15 * 60 * 1000);
-        void Notifications.dismissNotificationAsync(response.notification.request.identifier);
-        void Notifications.scheduleNotificationAsync({
-          content: {
-            title: typeof minderName === 'string' ? minderName : 'Minder',
-            body: 'Reminder (Snoozed)',
-            data: { minderId, minderName: typeof minderName === 'string' ? minderName : undefined, snoozedFromTriggerAt: triggerAt },
-            categoryIdentifier: 'MINDER_REMINDER',
-            sticky: true,
-          },
-          trigger: {
-            type: Notifications.SchedulableTriggerInputTypes.DATE,
-            date: snoozeAt,
-          },
-        });
-        return;
-      }
 
       if (response.actionIdentifier === 'COMPLETE') {
         const id = `completed:${minderId}:${typeof triggerAt === 'number' && !Number.isNaN(triggerAt) ? triggerAt : at}`;
@@ -139,11 +130,14 @@ function RootLayoutNav() {
     });
 
     void registerBackgroundFetchTask();
+    void scheduleHolidayNotifications();
 
     // Dismiss sticky minder notifications > 30 min past their trigger and log as missed
     void (async () => {
       const presented = await Notifications.getPresentedNotificationsAsync();
+      const allEvents = await getAllMinderEvents();
       const now = Date.now();
+      const TWO_HOURS = 2 * 60 * 60 * 1000;
       for (const notification of presented) {
         const mid = (notification.request.content.data as any)?.minderId;
         if (typeof mid !== 'string') continue;
@@ -152,8 +146,16 @@ function RootLayoutNav() {
         if (typeof triggerAt !== 'number' || Number.isNaN(triggerAt)) continue;
         if (now - triggerAt > 30 * 60 * 1000) {
           void Notifications.dismissNotificationAsync(notification.request.identifier);
-          const id = `missed:${mid}:${triggerAt}`;
-          void addMinderEvent({ id, minderId: mid, kind: 'missed', at: now, triggerAt });
+          const handled = allEvents.some(
+            e =>
+              e.minderId === mid &&
+              (e.kind === 'log' || e.kind === 'note' || e.kind === 'completed') &&
+              Math.abs(e.at - triggerAt) <= TWO_HOURS,
+          );
+          if (!handled) {
+            const id = `missed:${mid}:${triggerAt}`;
+            void addMinderEvent({ id, minderId: mid, kind: 'missed', at: now, triggerAt });
+          }
         }
       }
     })();
@@ -168,8 +170,10 @@ function RootLayoutNav() {
     <ThemeProvider>
       <Stack>
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+        <Stack.Screen name="onboarding" options={{ headerShown: false }} />
         <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
         <Stack.Screen name="create-minder" options={{ title: 'Create Minder' }} />
+        <Stack.Screen name="holidays" options={{ title: 'Holiday Reminders' }} />
       </Stack>
     </ThemeProvider>
   );

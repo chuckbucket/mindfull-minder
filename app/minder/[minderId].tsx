@@ -2,12 +2,15 @@ import { useCallback, useState } from 'react';
 import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity } from 'react-native';
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Haptics from 'expo-haptics';
+import * as StoreReview from 'expo-store-review';
 import { useTheme } from '../../context/ThemeContext';
 import * as Notifications from 'expo-notifications';
 import { addMinderEvent, getEventsForMinder, MinderEvent, Mood, upsertMissedEvents } from '../../logic/MinderEvents';
 
 const MINDERS_STORAGE_KEY = '@minders';
 const COMPLETIONS_STORAGE_KEY = '@completions';
+const REVIEW_COUNT_KEY = '@totalCompletionCount';
 
 type Minder = {
   id: string;
@@ -29,6 +32,38 @@ const kindLabel = (kind: MinderEvent['kind']) => {
   if (kind === 'completed') return 'Completed';
   if (kind === 'triggered') return 'Triggered';
   return 'Missed';
+};
+
+const toDateKey = (ms: number) => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+const computeStats = (events: MinderEvent[]) => {
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const recent = events.filter(e => e.at >= sevenDaysAgo);
+  const recentCompleted = recent.filter(e => e.kind === 'completed').length;
+  const recentMissed = recent.filter(e => e.kind === 'missed').length;
+  const total = recentCompleted + recentMissed;
+  const completionRate = total > 0 ? Math.round((recentCompleted / total) * 100) : null;
+  const totalLogs = events.filter(e => e.kind === 'log' || e.kind === 'note').length;
+
+  const completionDayKeys = new Set(
+    events.filter(e => e.kind === 'completed').map(e => toDateKey(e.at)),
+  );
+  const todayKey = toDateKey(Date.now());
+  let streak = 0;
+  const startDay = completionDayKeys.has(todayKey) ? 0 : 1;
+  for (let i = startDay; i < 365; i++) {
+    const key = toDateKey(Date.now() - i * 86400000);
+    if (completionDayKeys.has(key)) {
+      streak++;
+    } else {
+      break;
+    }
+  }
+
+  return { completionRate, totalLogs, streak };
 };
 
 export default function MinderHistoryScreen() {
@@ -80,6 +115,20 @@ export default function MinderHistoryScreen() {
     }, [load]),
   );
 
+  const maybeRequestReview = async () => {
+    try {
+      const raw = await AsyncStorage.getItem(REVIEW_COUNT_KEY);
+      const count = (Number(raw) || 0) + 1;
+      await AsyncStorage.setItem(REVIEW_COUNT_KEY, String(count));
+      if (count === 7) {
+        const available = await StoreReview.isAvailableAsync();
+        if (available) await StoreReview.requestReview();
+      }
+    } catch {
+      // non-critical
+    }
+  };
+
   const addNote = async () => {
     if (!minderId) return;
     const text = draft.trim();
@@ -120,11 +169,28 @@ export default function MinderHistoryScreen() {
     }
 
     await addMinderEvent({ minderId, kind: 'log', at: logAt, text, mood, triggerAt: triggerAtForLog });
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    await maybeRequestReview();
     setDraft('');
     setMood('neutral');
     await load();
   };
 
+  const handleRetroComplete = async (event: MinderEvent) => {
+    const triggerAt = event.triggerAt ?? event.at;
+    await addMinderEvent({
+      id: `completed:${event.minderId}:${triggerAt}`,
+      minderId: event.minderId,
+      kind: 'completed',
+      at: Date.now(),
+      triggerAt,
+    });
+    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    await maybeRequestReview();
+    await load();
+  };
+
+  const stats = computeStats(events);
   const missedCount = events.filter(e => e.kind === 'missed').length;
   const completedCount = events.filter(e => e.kind === 'completed').length;
 
@@ -133,7 +199,12 @@ export default function MinderHistoryScreen() {
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={[styles.backButton, { borderColor: colors.border }]}>
+        <TouchableOpacity
+          onPress={() => router.back()}
+          style={[styles.backButton, { borderColor: colors.border }]}
+          accessibilityLabel="Go back"
+          accessibilityRole="button"
+        >
           <Text style={{ color: colors.text, fontWeight: '700' }}>Back</Text>
         </TouchableOpacity>
         <View style={{ flex: 1 }}>
@@ -145,6 +216,26 @@ export default function MinderHistoryScreen() {
           </Text>
         </View>
         <View style={[styles.colorDot, { backgroundColor: minder?.color || colors.primary }]} />
+      </View>
+
+      {/* Stats card */}
+      <View style={[styles.statsCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <View style={styles.statItem}>
+          <Text style={[styles.statValue, { color: colors.primary }]}>
+            {stats.completionRate !== null ? `${stats.completionRate}%` : '—'}
+          </Text>
+          <Text style={[styles.statLabel, { color: colors.text }]}>7-day rate</Text>
+        </View>
+        <View style={[styles.statDivider, { backgroundColor: colors.border }]} />
+        <View style={styles.statItem}>
+          <Text style={[styles.statValue, { color: colors.primary }]}>{stats.streak}</Text>
+          <Text style={[styles.statLabel, { color: colors.text }]}>day streak</Text>
+        </View>
+        <View style={[styles.statDivider, { backgroundColor: colors.border }]} />
+        <View style={styles.statItem}>
+          <Text style={[styles.statValue, { color: colors.primary }]}>{stats.totalLogs}</Text>
+          <Text style={[styles.statLabel, { color: colors.text }]}>total logs</Text>
+        </View>
       </View>
 
       <View style={[styles.noteComposer, { backgroundColor: colors.card, borderColor: colors.border }]}>
@@ -161,9 +252,12 @@ export default function MinderHistoryScreen() {
                 styles.moodButton,
                 { backgroundColor: mood === m ? colors.primary : colors.card, borderColor: colors.border },
               ]}
+              accessibilityLabel={`Set mood to ${m}`}
+              accessibilityRole="button"
+              accessibilityState={{ selected: mood === m }}
             >
               <Text style={{ color: mood === m ? 'white' : colors.text, fontWeight: '800' }}>
-                {m === 'good' ? 'Good' : m === 'neutral' ? 'Neutral' : 'Bad'}
+                {m === 'good' ? '😊 Good' : m === 'neutral' ? '😐 Neutral' : '😟 Not great'}
               </Text>
             </TouchableOpacity>
           ))}
@@ -175,9 +269,15 @@ export default function MinderHistoryScreen() {
           placeholderTextColor={colors.text}
           multiline
           style={[styles.noteInput, { color: colors.text, borderColor: colors.border }]}
+          accessibilityLabel="Reflection text"
         />
         <View style={styles.noteActions}>
-          <TouchableOpacity onPress={addNote} style={[styles.primaryButton, { backgroundColor: colors.primary }]}>
+          <TouchableOpacity
+            onPress={addNote}
+            style={[styles.primaryButton, { backgroundColor: colors.primary }]}
+            accessibilityLabel="Save log entry"
+            accessibilityRole="button"
+          >
             <Text style={{ color: 'white', fontWeight: '800' }}>Save</Text>
           </TouchableOpacity>
         </View>
@@ -192,30 +292,50 @@ export default function MinderHistoryScreen() {
             <Text style={{ color: colors.text, opacity: 0.8 }}>No history yet.</Text>
           </View>
         }
-        renderItem={({ item }) => (
-          <View style={[styles.eventRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
-            <View style={styles.eventHeader}>
-              <Text style={{ color: colors.text, fontWeight: '800' }}>{kindLabel(item.kind)}</Text>
-              <Text style={{ color: colors.text, opacity: 0.75 }}>{formatWhen(item.at)}</Text>
-            </View>
-            {(item.kind === 'log' || item.kind === 'note') && (
-              <>
-                {item.mood && (
-                  <Text style={{ color: colors.text, marginTop: 8, opacity: 0.85 }}>
-                    Mood: {item.mood === 'good' ? 'Good' : item.mood === 'neutral' ? 'Neutral' : 'Bad'}
+        renderItem={({ item }) => {
+          const isMissed = item.kind === 'missed';
+          return (
+            <View style={[styles.eventRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
+              <View style={styles.eventHeader}>
+                <Text style={{ color: colors.text, fontWeight: '800' }}>{kindLabel(item.kind)}</Text>
+                <Text style={{ color: colors.text, opacity: 0.75 }}>{formatWhen(item.at)}</Text>
+              </View>
+              {(item.kind === 'log' || item.kind === 'note') && (
+                <>
+                  {item.mood && (
+                    <Text style={{ color: colors.text, marginTop: 8, opacity: 0.85 }}>
+                      Mood: {item.mood === 'good' ? '😊 Good' : item.mood === 'neutral' ? '😐 Neutral' : '😟 Not great'}
+                    </Text>
+                  )}
+                  {!!item.text && <Text style={{ color: colors.text, marginTop: 8 }}>{item.text}</Text>}
+                  {item.triggerAt && (
+                    <Text style={{ color: colors.text, marginTop: 8, opacity: 0.85 }}>Reminder: {formatWhen(item.triggerAt)}</Text>
+                  )}
+                </>
+              )}
+              {item.kind !== 'log' && item.kind !== 'note' && item.triggerAt && (
+                <Text style={{ color: colors.text, marginTop: 8, opacity: 0.85 }}>Trigger: {formatWhen(item.triggerAt)}</Text>
+              )}
+              {isMissed && (
+                <View style={styles.missedFooter}>
+                  <Text style={[styles.gentleText, { color: colors.text }]}>
+                    That's okay — every moment is a fresh start. 🌱
                   </Text>
-                )}
-                {!!item.text && <Text style={{ color: colors.text, marginTop: 8 }}>{item.text}</Text>}
-                {item.triggerAt && (
-                  <Text style={{ color: colors.text, marginTop: 8, opacity: 0.85 }}>Reminder: {formatWhen(item.triggerAt)}</Text>
-                )}
-              </>
-            )}
-            {item.kind !== 'log' && item.kind !== 'note' && item.triggerAt && (
-              <Text style={{ color: colors.text, marginTop: 8, opacity: 0.85 }}>Trigger: {formatWhen(item.triggerAt)}</Text>
-            )}
-          </View>
-        )}
+                  <TouchableOpacity
+                    style={[styles.retroButton, { backgroundColor: `${colors.primary}22`, borderColor: colors.primary }]}
+                    onPress={() => handleRetroComplete(item)}
+                    accessibilityLabel="Mark this reminder as done retroactively"
+                    accessibilityRole="button"
+                  >
+                    <Text style={[styles.retroButtonText, { color: colors.primary }]}>
+                      I actually did it ✓
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
+          );
+        }}
       />
     </View>
   );
@@ -246,6 +366,34 @@ const styles = StyleSheet.create({
     width: 16,
     height: 16,
     borderRadius: 8,
+  },
+  statsCard: {
+    flexDirection: 'row',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    alignItems: 'center',
+  },
+  statItem: {
+    flex: 1,
+    alignItems: 'center',
+    gap: 4,
+  },
+  statValue: {
+    fontSize: 22,
+    fontWeight: '800',
+  },
+  statLabel: {
+    fontSize: 11,
+    opacity: 0.65,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  statDivider: {
+    width: 1,
+    height: 36,
+    marginHorizontal: 8,
   },
   noteComposer: {
     borderWidth: 1,
@@ -292,5 +440,25 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     gap: 10,
+  },
+  missedFooter: {
+    marginTop: 10,
+    gap: 8,
+  },
+  gentleText: {
+    fontSize: 12,
+    opacity: 0.65,
+    fontStyle: 'italic',
+  },
+  retroButton: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  retroButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
   },
 });

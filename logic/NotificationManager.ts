@@ -28,13 +28,16 @@ export const scheduleNotificationsForAllMinders = async () => {
     log.info('Finished scheduling notifications for all minders.');
 };
 
-export const scheduleNotificationsForMinder = async (minderData: any, onProgress?: (progress: number) => void) => {
+export const scheduleNotificationsForMinder = async (
+    minderData: any,
+    onProgress?: (progress: number) => void,
+): Promise<{ scheduled: number; planned: number }> => {
     log.info(`Scheduling notifications for minder: ${minderData.name}`);
     await cancelNotificationsForMinder(minderData.id);
 
-    if (minderData.reminderFrequency === 'Continuous') {
+    if (minderData.paused || minderData.reminderFrequency === 'Continuous') {
         onProgress?.(1);
-        return;
+        return { scheduled: 0, planned: 0 };
     }
 
     const allScheduled = await Notifications.getAllScheduledNotificationsAsync();
@@ -45,7 +48,7 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
     if (availableSlots <= 0) {
         log.warn('No available notification slots.');
         onProgress?.(1);
-        return;
+        return { scheduled: 0, planned: 0 };
     }
 
     const now = new Date();
@@ -58,6 +61,10 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
     const startMinutes = typeof minderData.notificationStartTime === 'string' ? parseClockTimeToMinutes(minderData.notificationStartTime) : null;
     const endMinutes = typeof minderData.notificationEndTime === 'string' ? parseClockTimeToMinutes(minderData.notificationEndTime) : null;
     const hasWindow = startMinutes !== null && endMinutes !== null && startMinutes !== endMinutes;
+    const parsedWeekdays = Array.isArray(minderData.selectedWeekdays)
+        ? minderData.selectedWeekdays.filter((d: unknown): d is number => Number.isInteger(d) && d >= 0 && d <= 6)
+        : [];
+    const activeWeekdays = parsedWeekdays.length > 0 ? parsedWeekdays : [0, 1, 2, 3, 4, 5, 6];
 
     if (minderData.reminderFrequency === 'Daily' && hasWindow && startMinutes !== null && endMinutes !== null) {
         const windowMs = endMinutes > startMinutes
@@ -71,17 +78,26 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
         for (let day = 0; newNotificationTimes.length < availableSlots; day++) {
             const dayWindowStart = new Date(todayWindowStart.getTime() + day * 24 * 60 * 60 * 1000);
             if (dayWindowStart >= scheduleUntil) break;
+            if (!activeWeekdays.includes(dayWindowStart.getDay())) continue;
 
             for (let i = 0; i < minderData.quantity && newNotificationTimes.length < availableSlots; i++) {
                 let t: Date;
                 if (minderData.intervalType === 'Random') {
-                    const randomOffset = (Math.random() - 0.5) * spacing * 0.6;
-                    t = moveDateIntoTimeWindow(new Date(dayWindowStart.getTime() + i * spacing + randomOffset), startMinutes, endMinutes);
+                    if (minderData.quantity === 1) {
+                        const randomMsInWindow = Math.random() * windowMs;
+                        t = moveDateIntoTimeWindow(new Date(dayWindowStart.getTime() + randomMsInWindow), startMinutes, endMinutes);
+                    } else {
+                        const randomOffset = (Math.random() - 0.5) * spacing;
+                        t = moveDateIntoTimeWindow(new Date(dayWindowStart.getTime() + i * spacing + randomOffset), startMinutes, endMinutes);
+                    }
                 } else {
                     t = new Date(dayWindowStart.getTime() + i * spacing);
                 }
                 if (t > now && t < scheduleUntil) {
-                    newNotificationTimes.push(t);
+                    const isAlreadyScheduled = newNotificationTimes.some(existing => Math.abs(existing.getTime() - t.getTime()) < 60000);
+                    if (!isAlreadyScheduled) {
+                        newNotificationTimes.push(t);
+                    }
                 }
             }
         }
@@ -109,6 +125,23 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
         }
     }
 
+    // Enforce global quiet hours
+    const quietHoursRaw = await AsyncStorage.getItem('@quietHours');
+    if (quietHoursRaw) {
+        try {
+            const qh = JSON.parse(quietHoursRaw);
+            if (qh?.enabled && typeof qh.start === 'string' && typeof qh.end === 'string') {
+                const qStartMin = parseClockTimeToMinutes(qh.start);
+                const qEndMin = parseClockTimeToMinutes(qh.end);
+                if (qStartMin !== null && qEndMin !== null && qStartMin !== qEndMin) {
+                    newNotificationTimes = newNotificationTimes.filter(t => !isWithinTimeWindow(t, qStartMin!, qEndMin!));
+                }
+            }
+        } catch {
+            // ignore malformed quiet hours
+        }
+    }
+
     log.info(`Calculated ${newNotificationTimes.length} notification times. ${availableSlots} slots were available.`);
 
     let scheduledCount = 0;
@@ -119,7 +152,7 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
             await Notifications.scheduleNotificationAsync({
                 content: {
                     title: minderData.name,
-                    body: 'Reminder',
+                    body: minderData.note?.trim() || 'Reminder',
                     data: { minderId: minderData.id, minderName: minderData.name },
                     categoryIdentifier: 'MINDER_REMINDER',
                     sticky: true,
@@ -140,6 +173,7 @@ export const scheduleNotificationsForMinder = async (minderData: any, onProgress
 
     // Ensure progress reaches 100% even if there are no notifications
     onProgress?.(1);
+    return { scheduled: scheduledCount, planned: newNotificationTimes.length };
 };
 
 export const cancelNotificationsForMinder = async (minderId: string) => {

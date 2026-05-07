@@ -1,11 +1,14 @@
 import { Ionicons } from "@expo/vector-icons"
 import AsyncStorage from "@react-native-async-storage/async-storage"
+import * as Haptics from "expo-haptics"
 import * as Notifications from "expo-notifications"
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router"
+import * as StoreReview from "expo-store-review"
 import { useCallback, useEffect, useState } from "react"
 import {
   Alert,
   FlatList,
+  Linking,
   Modal,
   StyleSheet,
   Text,
@@ -18,12 +21,14 @@ import { useTheme } from "../../context/ThemeContext"
 import {
   addMinderEvent,
   getAllMinderEvents,
+  MinderEvent,
   upsertMissedEvents,
 } from "../../logic/MinderEvents"
 import { scheduleNotificationsForAllMinders } from "../../logic/NotificationManager"
 
 const MINDERS_STORAGE_KEY = "@minders"
 const COMPLETIONS_STORAGE_KEY = "@completions"
+const REVIEW_COUNT_KEY = "@totalCompletionCount"
 
 interface Minder {
   id: string
@@ -33,17 +38,43 @@ interface Minder {
   quantity: number
   note?: string
   successStreak?: number
+  notificationStartTime?: string
+  notificationEndTime?: string
+  minderType?: "complete" | "note"
+  paused?: boolean
 }
 
-const exampleMinders = [
-  { id: "1", name: "Check in with a friend today." },
-  {
-    id: "2",
-    name: "Take a 5-minute sensory break: listen to calming music or use a weighted blanket.",
-  },
-  { id: "3", name: "Break down a large task into smaller steps." },
-  { id: "4", name: "Am I feeling overwhelmed? It's okay to take a break." },
-]
+const toStatDateKey = (ms: number) => {
+  const d = new Date(ms)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function computeCardStats(events: MinderEvent[]): { completionRate: number | null; streak: number } {
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
+  const recent = events.filter(e => e.at >= sevenDaysAgo)
+  const recentCompleted = recent.filter(e => e.kind === 'completed').length
+  const recentMissed = recent.filter(e => e.kind === 'missed').length
+  const total = recentCompleted + recentMissed
+  const completionRate = total > 0 ? Math.round((recentCompleted / total) * 100) : null
+
+  const completionDayKeys = new Set(events.filter(e => e.kind === 'completed').map(e => toStatDateKey(e.at)))
+  const todayKey = toStatDateKey(Date.now())
+  let streak = 0
+  const startDay = completionDayKeys.has(todayKey) ? 0 : 1
+  for (let i = startDay; i < 365; i++) {
+    if (completionDayKeys.has(toStatDateKey(Date.now() - i * 86400000))) streak++
+    else break
+  }
+
+  return { completionRate, streak }
+}
+
+const formatHHMM = (hhmm: string): string => {
+  const [h, m] = hhmm.split(":").map(Number)
+  const d = new Date()
+  d.setHours(h, m, 0, 0)
+  return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
+}
 
 export default function HomeScreen() {
   const [minders, setMinders] = useState<Minder[]>([])
@@ -67,6 +98,11 @@ export default function HomeScreen() {
   const [noteMood, setNoteMood] = useState<"good" | "neutral" | "bad">(
     "neutral",
   )
+  const [notifStatus, setNotifStatus] = useState<string>("unknown")
+  const [completingIds, setCompletingIds] = useState<Set<string>>(new Set())
+  const [reorderMode, setReorderMode] = useState(false)
+  const [minderStatsMap, setMinderStatsMap] = useState<Record<string, { completionRate: number | null; streak: number }>>({})
+
   const { colors } = useTheme()
   const router = useRouter()
   const { openLogFor, logTriggerAt } = useLocalSearchParams<{
@@ -81,9 +117,17 @@ export default function HomeScreen() {
   useEffect(() => {
     if (!openLogFor) return
     const ta = logTriggerAt ? Number(logTriggerAt) : undefined
-    openNoteModal(openLogFor, typeof ta === "number" && !isNaN(ta) ? ta : undefined)
+    openNoteModal(
+      openLogFor,
+      typeof ta === "number" && !isNaN(ta) ? ta : undefined,
+    )
     router.setParams({ openLogFor: undefined, logTriggerAt: undefined })
   }, [openLogFor])
+
+  const checkNotifPermission = useCallback(async () => {
+    const { status } = await Notifications.getPermissionsAsync()
+    setNotifStatus(status)
+  }, [])
 
   const getClosestTriggerAtWithinWindow = useCallback(
     (minderId: string, atMs: number, windowMs: number) => {
@@ -91,7 +135,9 @@ export default function HomeScreen() {
 
       const scheduled = (notifications as any[])
         .filter((n) => n?.content?.data?.minderId === minderId)
-        .map((n) => n?.trigger?.value ?? n?.trigger?.timestamp ?? n?.trigger?.date)
+        .map(
+          (n) => n?.trigger?.value ?? n?.trigger?.timestamp ?? n?.trigger?.date,
+        )
         .filter(Boolean)
         .map((d: any) => new Date(d).getTime())
         .filter(
@@ -125,13 +171,16 @@ export default function HomeScreen() {
       scheduled: any[],
       loadedCompletions: { [key: string]: number[] },
       handledTriggerAtsSnapshot: Record<string, Set<number>>,
+      logAtsByMinder: Record<string, number[]>,
     ) => {
       const now = Date.now()
+      const TWO_HOURS = 2 * 60 * 60 * 1000
       const missedByMinder: Record<string, number[]> = {}
 
       for (const notif of scheduled) {
         const minderId = notif?.content?.data?.minderId
-        const triggerDateValue = (notif?.trigger as any)?.value ?? notif?.trigger?.timestamp
+        const triggerDateValue =
+          (notif?.trigger as any)?.value ?? notif?.trigger?.timestamp
         if (!minderId || !triggerDateValue) continue
 
         const triggerAt = new Date(triggerDateValue).getTime()
@@ -144,6 +193,10 @@ export default function HomeScreen() {
           continue
         const legacy = loadedCompletions[minderId] || []
         if (legacy.some((compTime) => compTime > triggerAt)) continue
+
+        const logAts = logAtsByMinder[minderId] || []
+        if (logAts.some((logAt) => Math.abs(logAt - triggerAt) <= TWO_HOURS))
+          continue
 
         missedByMinder[minderId] = missedByMinder[minderId] || []
         missedByMinder[minderId].push(triggerAt)
@@ -158,7 +211,7 @@ export default function HomeScreen() {
     [],
   )
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     try {
       const storedMinders = await AsyncStorage.getItem(MINDERS_STORAGE_KEY)
       const loadedMinders = storedMinders
@@ -181,9 +234,10 @@ export default function HomeScreen() {
       const allEvents = await getAllMinderEvents()
       const handledMap: Record<string, Set<number>> = {}
       const triggeredMap: Record<string, Set<number>> = {}
+      const logAtsMap: Record<string, number[]> = {}
       for (const event of allEvents) {
-        if (typeof event.triggerAt !== "number") continue
         if (event.kind === "triggered") {
+          if (typeof event.triggerAt !== "number") continue
           triggeredMap[event.minderId] =
             triggeredMap[event.minderId] || new Set<number>()
           triggeredMap[event.minderId].add(event.triggerAt)
@@ -193,9 +247,13 @@ export default function HomeScreen() {
           event.kind === "log" ||
           event.kind === "note"
         ) {
-          handledMap[event.minderId] =
-            handledMap[event.minderId] || new Set<number>()
-          handledMap[event.minderId].add(event.triggerAt)
+          if (typeof event.triggerAt === "number") {
+            handledMap[event.minderId] =
+              handledMap[event.minderId] || new Set<number>()
+            handledMap[event.minderId].add(event.triggerAt)
+          }
+          logAtsMap[event.minderId] = logAtsMap[event.minderId] || []
+          logAtsMap[event.minderId].push(event.at)
         }
       }
       setHandledTriggerAtsByMinder(
@@ -215,24 +273,56 @@ export default function HomeScreen() {
         ),
       )
 
+      // Compute per-minder stats for card dashboards
+      const eventsByMinder = new Map<string, MinderEvent[]>()
+      for (const event of allEvents) {
+        if (event.minderId === '__global__') continue
+        const list = eventsByMinder.get(event.minderId) ?? []
+        list.push(event)
+        eventsByMinder.set(event.minderId, list)
+      }
+      const statsMap: Record<string, { completionRate: number | null; streak: number }> = {}
+      for (const m of loadedMinders) {
+        statsMap[m.id] = computeCardStats(eventsByMinder.get(m.id) ?? [])
+      }
+      setMinderStatsMap(statsMap)
+
       await syncMissedReminders(
         loadedMinders,
         scheduledNotifications as any[],
         loadedCompletions,
         handledMap,
+        logAtsMap,
       )
     } catch (error) {
       console.error("Error loading data:", error)
     }
-  }
+  }, [syncMissedReminders])
 
   useFocusEffect(
     useCallback(() => {
       void loadData()
-    }, [syncMissedReminders]),
+      void checkNotifPermission()
+    }, [loadData, checkNotifPermission]),
   )
 
+  const maybeRequestReview = async () => {
+    try {
+      const raw = await AsyncStorage.getItem(REVIEW_COUNT_KEY)
+      const count = (Number(raw) || 0) + 1
+      await AsyncStorage.setItem(REVIEW_COUNT_KEY, String(count))
+      if (count === 7) {
+        const available = await StoreReview.isAvailableAsync()
+        if (available) await StoreReview.requestReview()
+      }
+    } catch {
+      // non-critical
+    }
+  }
+
   const handleComplete = async (minderId: string, triggerAt?: number) => {
+    if (completingIds.has(minderId)) return
+    setCompletingIds((prev) => new Set([...prev, minderId]))
     try {
       const updatedMinders = minders.map((minder) => {
         if (
@@ -273,11 +363,49 @@ export default function HomeScreen() {
         triggerAt,
       })
 
-      Alert.alert("Success", "Minder marked as complete!")
-      loadData()
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success)
+      await maybeRequestReview()
+      Alert.alert("Done!", "Minder marked as complete!")
+      void loadData()
     } catch (error) {
       console.error("Error completing minder:", error)
+    } finally {
+      setCompletingIds((prev) => {
+        const next = new Set(prev)
+        next.delete(minderId)
+        return next
+      })
     }
+  }
+
+  const handlePauseToggle = async (minderId: string) => {
+    const updated = minders.map((m) =>
+      m.id === minderId ? { ...m, paused: !m.paused } : m,
+    )
+    setMinders(updated)
+    await AsyncStorage.setItem(MINDERS_STORAGE_KEY, JSON.stringify(updated))
+    await scheduleNotificationsForAllMinders()
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
+  }
+
+  const handleMoveUp = async (id: string) => {
+    const idx = minders.findIndex((m) => m.id === id)
+    if (idx <= 0) return
+    const updated = [...minders]
+    ;[updated[idx - 1], updated[idx]] = [updated[idx], updated[idx - 1]]
+    setMinders(updated)
+    await AsyncStorage.setItem(MINDERS_STORAGE_KEY, JSON.stringify(updated))
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
+  }
+
+  const handleMoveDown = async (id: string) => {
+    const idx = minders.findIndex((m) => m.id === id)
+    if (idx < 0 || idx >= minders.length - 1) return
+    const updated = [...minders]
+    ;[updated[idx + 1], updated[idx]] = [updated[idx], updated[idx + 1]]
+    setMinders(updated)
+    await AsyncStorage.setItem(MINDERS_STORAGE_KEY, JSON.stringify(updated))
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
   }
 
   const openNoteModal = (minderId: string, preferredTriggerAt?: number) => {
@@ -285,8 +413,6 @@ export default function HomeScreen() {
     setNoteText("")
     setNoteMood("neutral")
 
-    // If caller already knows the trigger time (e.g. from a notification action),
-    // use it immediately — don't wait for minder state to be loaded.
     if (typeof preferredTriggerAt === "number") {
       setNoteTriggerAt(preferredTriggerAt)
       setNoteModalVisible(true)
@@ -337,48 +463,59 @@ export default function HomeScreen() {
     const logAt = Date.now()
     let triggerAtForLog = noteTriggerAt
 
-    if (minder && minder.reminderFrequency !== "Continuous") {
-      const snapped = getClosestTriggerAtWithinWindow(
-        noteMinderId,
-        logAt,
-        15 * 60 * 1000,
-      )
-      if (typeof snapped === "number") {
-        triggerAtForLog = snapped
-        void addMinderEvent({
-          id: `completed:${noteMinderId}:${snapped}`,
+    try {
+      if (minder && minder.reminderFrequency !== "Continuous") {
+        const snapped = getClosestTriggerAtWithinWindow(
+          noteMinderId,
+          logAt,
+          15 * 60 * 1000,
+        )
+        if (typeof snapped === "number") {
+          triggerAtForLog = snapped
+          await addMinderEvent({
+            id: `completed:${noteMinderId}:${snapped}`,
+            minderId: noteMinderId,
+            kind: "completed",
+            at: logAt,
+            triggerAt: snapped,
+          })
+        }
+      }
+
+      if (
+        minder &&
+        minder.reminderFrequency !== "Continuous" &&
+        typeof triggerAtForLog !== "number"
+      ) {
+        const manualAt = logAt
+        triggerAtForLog = manualAt
+        await addMinderEvent({
+          id: `triggered:${noteMinderId}:${manualAt}`,
           minderId: noteMinderId,
-          kind: "completed",
-          at: logAt,
-          triggerAt: snapped,
+          kind: "triggered",
+          at: manualAt,
+          triggerAt: manualAt,
         })
       }
-    }
 
-    if (
-      minder &&
-      minder.reminderFrequency !== "Continuous" &&
-      typeof triggerAtForLog !== "number"
-    ) {
-      const manualAt = logAt
-      triggerAtForLog = manualAt
-      void addMinderEvent({
-        id: `triggered:${noteMinderId}:${manualAt}`,
+      await addMinderEvent({
         minderId: noteMinderId,
-        kind: "triggered",
-        at: manualAt,
-        triggerAt: manualAt,
+        kind: "log",
+        at: logAt,
+        text: trimmed,
+        triggerAt: triggerAtForLog,
+        mood: noteMood,
       })
+    } catch (err) {
+      console.error("Error saving log:", err)
+      Alert.alert(
+        "Save failed",
+        "Your log could not be saved. Please try again.",
+      )
+      return
     }
 
-    await addMinderEvent({
-      minderId: noteMinderId,
-      kind: "log",
-      at: logAt,
-      text: trimmed,
-      triggerAt: triggerAtForLog,
-      mood: noteMood,
-    })
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium)
     setNoteModalVisible(false)
     void loadData()
   }
@@ -396,6 +533,7 @@ export default function HomeScreen() {
         MINDERS_STORAGE_KEY,
         JSON.stringify(updatedMinders),
       )
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
     } catch (error) {
       console.error("Error updating minder:", error)
       Alert.alert("Error", "Failed to update the minder.")
@@ -412,7 +550,10 @@ export default function HomeScreen() {
         if (!triggerDateValue) return null
         return new Date(triggerDateValue)
       })
-      .filter((date): date is Date => date !== null && !isNaN((date as Date).getTime()))
+      .filter(
+        (date): date is Date =>
+          date !== null && !isNaN((date as Date).getTime()),
+      )
 
     const pastNotifications = minderNotifications
       .filter((date) => date <= now)
@@ -464,15 +605,24 @@ export default function HomeScreen() {
     return "Due now"
   }
 
-  const renderMinderItem = ({ item }: { item: Minder }) => {
+  const renderMinderItem = ({
+    item,
+    index,
+  }: {
+    item: Minder
+    index: number
+  }) => {
     const triggerInfo = getNextTriggerInfo(item.id)
     const now = new Date()
     const diffMs = triggerInfo.date
       ? triggerInfo.date.getTime() - now.getTime()
       : -1
+    const isCompleting = completingIds.has(item.id)
     const isActionable =
-      triggerInfo.isPastDue ||
-      (triggerInfo.date && diffMs > 0 && diffMs <= 60 * 60 * 1000)
+      !item.paused &&
+      !isCompleting &&
+      (triggerInfo.isPastDue ||
+        (triggerInfo.date && diffMs > 0 && diffMs <= 60 * 60 * 1000))
     const triggerAt = triggerInfo.date ? triggerInfo.date.getTime() : undefined
 
     const handlePress = () => {
@@ -480,15 +630,32 @@ export default function HomeScreen() {
     }
 
     return (
-      <TouchableOpacity onPress={handlePress} activeOpacity={0.8}>
-        <View style={[styles.minderItem, { backgroundColor: item.color }]}>
+      <TouchableOpacity
+        onPress={handlePress}
+        activeOpacity={0.8}
+        accessibilityLabel={`${item.name} minder. Tap to edit.`}
+        accessibilityRole="button"
+      >
+        <View
+          style={[
+            styles.minderItem,
+            { backgroundColor: item.color, opacity: item.paused ? 0.6 : 1 },
+          ]}
+        >
           <View style={styles.minderContent}>
-            <Text style={[styles.minderName, { color: "white" }]}>
-              {item.name}
-            </Text>
+            <View style={styles.minderNameRow}>
+              <Text style={[styles.minderName, { color: "white" }]}>
+                {item.name}
+              </Text>
+              {item.paused && (
+                <View style={styles.pausedBadge}>
+                  <Text style={styles.pausedBadgeText}>Paused</Text>
+                </View>
+              )}
+            </View>
             {item.note && (
               <Text style={[styles.minderNote, { color: "white" }]}>
-                Note: {item.note}
+                {item.note}
               </Text>
             )}
 
@@ -498,19 +665,43 @@ export default function HomeScreen() {
                   style={[styles.minderNote, { color: "white", marginTop: 8 }]}
                 >
                   {item.reminderFrequency}, {item.quantity} times
+                  {item.notificationStartTime && item.notificationEndTime
+                    ? `  •  ${formatHHMM(item.notificationStartTime)} – ${formatHHMM(item.notificationEndTime)}`
+                    : ""}
                 </Text>
-                <Text
-                  style={[
-                    styles.minderNote,
-                    { color: triggerInfo.isPastDue ? "#ffdddd" : "white" },
-                  ]}
-                >
-                  {formatTimeUntil(triggerInfo.date)}
-                </Text>
+                {!item.paused && (
+                  <Text
+                    style={[
+                      styles.minderNote,
+                      { color: triggerInfo.isPastDue ? "#ffdddd" : "white" },
+                    ]}
+                  >
+                    {formatTimeUntil(triggerInfo.date)}
+                  </Text>
+                )}
               </>
             )}
 
-            {item.reminderFrequency === "Continuous" && (
+            {(() => {
+              const s = minderStatsMap[item.id]
+              if (!s || (s.completionRate === null && s.streak === 0)) return null
+              return (
+                <View style={styles.statsStrip}>
+                  {s.streak > 0 && (
+                    <View style={styles.statPill}>
+                      <Text style={styles.statPillText}>🔥 {s.streak}d streak</Text>
+                    </View>
+                  )}
+                  {s.completionRate !== null && (
+                    <View style={styles.statPill}>
+                      <Text style={styles.statPillText}>{s.completionRate}% this week</Text>
+                    </View>
+                  )}
+                </View>
+              )
+            })()}
+
+            {item.reminderFrequency === "Continuous" && !reorderMode && (
               <View style={styles.continuousContainer}>
                 <Text style={{ color: "white" }}>
                   Success Streak: {item.successStreak || 0}
@@ -522,6 +713,8 @@ export default function HomeScreen() {
                       { backgroundColor: "rgba(255, 255, 255, 0.3)" },
                     ]}
                     onPress={() => openNoteModal(item.id)}
+                    accessibilityLabel={`Add log for ${item.name}`}
+                    accessibilityRole="button"
                   >
                     <Text style={styles.buttonText}>Log</Text>
                   </TouchableOpacity>
@@ -531,6 +724,8 @@ export default function HomeScreen() {
                       { backgroundColor: "rgba(255, 255, 255, 0.3)" },
                     ]}
                     onPress={() => router.push(`/minder/${item.id}`)}
+                    accessibilityLabel={`View history for ${item.name}`}
+                    accessibilityRole="button"
                   >
                     <Text style={styles.buttonText}>History</Text>
                   </TouchableOpacity>
@@ -541,69 +736,142 @@ export default function HomeScreen() {
                     { backgroundColor: "rgba(255, 255, 255, 0.3)" },
                   ]}
                   onPress={() => handleComplete(item.id)}
+                  accessibilityLabel={`Mark ${item.name} as success`}
+                  accessibilityRole="button"
                 >
                   <Text style={styles.buttonText}>Success</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={[styles.button, styles.failButton]}
                   onPress={() => handleFail(item.id)}
+                  accessibilityLabel={`Mark ${item.name} as not done`}
+                  accessibilityRole="button"
                 >
-                  <Text style={styles.buttonText}>Fail</Text>
+                  <Text style={styles.buttonText}>Not today</Text>
                 </TouchableOpacity>
               </View>
             )}
           </View>
-          {item.reminderFrequency !== "Continuous" && (
+          {reorderMode ? (
             <View style={styles.rightActions}>
               <TouchableOpacity
                 style={styles.iconButton}
-                onPress={() => openNoteModal(item.id, triggerAt)}
+                onPress={() => handleMoveUp(item.id)}
+                disabled={index === 0}
+                accessibilityLabel={`Move ${item.name} up`}
+                accessibilityRole="button"
               >
-                <Ionicons name="create-outline" size={20} color="white" />
+                <Ionicons
+                  name="chevron-up"
+                  size={24}
+                  color="white"
+                  style={{ opacity: index === 0 ? 0.3 : 1 }}
+                />
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.iconButton}
+                onPress={() => handleMoveDown(item.id)}
+                disabled={index === minders.length - 1}
+                accessibilityLabel={`Move ${item.name} down`}
+                accessibilityRole="button"
+              >
+                <Ionicons
+                  name="chevron-down"
+                  size={24}
+                  color="white"
+                  style={{ opacity: index === minders.length - 1 ? 0.3 : 1 }}
+                />
+              </TouchableOpacity>
+            </View>
+          ) : item.reminderFrequency !== "Continuous" ? (
+            <View style={styles.rightActions}>
+              <TouchableOpacity
+                style={styles.iconButton}
+                onPress={() => handlePauseToggle(item.id)}
+                accessibilityLabel={
+                  item.paused ? `Resume ${item.name}` : `Pause ${item.name}`
+                }
+                accessibilityRole="button"
+              >
+                <Ionicons
+                  name={
+                    item.paused ? "play-circle-outline" : "pause-circle-outline"
+                  }
+                  size={20}
+                  color="white"
+                />
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.iconButton}
                 onPress={() => router.push(`/minder/${item.id}`)}
+                accessibilityLabel={`View history for ${item.name}`}
+                accessibilityRole="button"
               >
                 <Ionicons name="time-outline" size={20} color="white" />
               </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.completeButton}
-                onPress={() => handleComplete(item.id, triggerAt)}
-                disabled={!isActionable}
-              >
-                <Ionicons
-                  name="checkmark-circle-outline"
-                  size={32}
-                  color={isActionable ? "white" : "rgba(255, 255, 255, 0.5)"}
-                />
-              </TouchableOpacity>
+              {item.minderType === "note" ? (
+                <TouchableOpacity
+                  style={styles.completeButton}
+                  onPress={() => openNoteModal(item.id, triggerAt)}
+                  disabled={!isActionable}
+                  accessibilityLabel={
+                    isActionable
+                      ? `Add log for ${item.name}`
+                      : `${item.name} not yet due`
+                  }
+                  accessibilityRole="button"
+                >
+                  <Ionicons
+                    name="create-outline"
+                    size={32}
+                    color={isActionable ? "white" : "rgba(255, 255, 255, 0.5)"}
+                  />
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity
+                  style={styles.completeButton}
+                  onPress={() => handleComplete(item.id, triggerAt)}
+                  disabled={!isActionable}
+                  accessibilityLabel={
+                    isActionable
+                      ? `Complete ${item.name}`
+                      : `${item.name} not yet due`
+                  }
+                  accessibilityRole="button"
+                >
+                  <Ionicons
+                    name="checkmark-circle-outline"
+                    size={32}
+                    color={isActionable ? "white" : "rgba(255, 255, 255, 0.5)"}
+                  />
+                </TouchableOpacity>
+              )}
             </View>
-          )}
+          ) : null}
         </View>
       </TouchableOpacity>
     )
   }
 
-  const renderExampleItem = ({
-    item,
-  }: {
-    item: { id: string; name: string }
-  }) => (
-    <View style={[styles.exampleItem, { backgroundColor: colors.card }]}>
-      <Text style={[styles.exampleName, { color: colors.text }]}>
-        {item.name}
-      </Text>
-    </View>
-  )
-
   return (
-    <SafeAreaView
-      style={[styles.container, { backgroundColor: colors.background }]}
-    >
+    <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
+      {notifStatus === "denied" && (
+        <TouchableOpacity
+          style={styles.permBanner}
+          onPress={() => Linking.openSettings()}
+          accessibilityLabel="Notifications are disabled. Tap to open Settings and enable them."
+          accessibilityRole="button"
+        >
+          <Ionicons name="notifications-off-outline" size={16} color="white" />
+          <Text style={styles.permBannerText}>
+            Notifications are off. Tap to enable in Settings.
+          </Text>
+        </TouchableOpacity>
+      )}
+
       <FlatList
         data={minders}
-        renderItem={renderMinderItem}
+        renderItem={({ item, index }) => renderMinderItem({ item, index })}
         keyExtractor={(item) => item.id}
         style={{ width: "100%" }}
         ListHeaderComponent={
@@ -611,28 +879,61 @@ export default function HomeScreen() {
             <Text style={[styles.title, { color: colors.text }]}>
               Your Minders
             </Text>
-            <TouchableOpacity
-              style={[styles.addButton, { backgroundColor: colors.primary }]}
-              onPress={() => router.push("/create-minder")}
+            <View
+              style={{ flexDirection: "row", gap: 8, alignItems: "center" }}
             >
-              <Text style={styles.addButtonText}>+ Add Minder</Text>
-            </TouchableOpacity>
+              {minders.length > 1 && (
+                <TouchableOpacity
+                  style={[
+                    styles.reorderButton,
+                    {
+                      backgroundColor: reorderMode ? colors.text : colors.card,
+                    },
+                  ]}
+                  onPress={() => setReorderMode((r) => !r)}
+                  accessibilityLabel={
+                    reorderMode ? "Done reordering" : "Reorder minders"
+                  }
+                  accessibilityRole="button"
+                >
+                  <Ionicons
+                    name={reorderMode ? "checkmark" : "swap-vertical-outline"}
+                    size={18}
+                    color={reorderMode ? colors.background : colors.text}
+                  />
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                style={[styles.addButton, { backgroundColor: colors.primary }]}
+                onPress={() => router.push("/create-minder")}
+                accessibilityLabel="Add a new minder"
+                accessibilityRole="button"
+              >
+                <Text style={styles.addButtonText}>+ Add Minder</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         }
         ListEmptyComponent={
-          <View style={{ width: "100%" }}>
-            <Text style={[styles.title, { color: colors.text, marginTop: 60 }]}>
-              No Minders Yet
+          <View style={styles.emptyState}>
+            <Text style={styles.emptyEmoji}>🌱</Text>
+            <Text style={[styles.emptyTitle, { color: colors.text }]}>
+              No minders yet
             </Text>
-            <Text style={[styles.subtitle, { color: colors.text }]}>
-              Here are some ideas to get you started:
+            <Text style={[styles.emptySubtitle, { color: colors.text }]}>
+              Create a gentle reminder to check in with yourself throughout the
+              day.
             </Text>
-            <FlatList
-              data={exampleMinders}
-              renderItem={renderExampleItem}
-              keyExtractor={(item) => item.id}
-              style={{ width: "100%" }}
-            />
+            <TouchableOpacity
+              style={[styles.emptyButton, { backgroundColor: colors.primary }]}
+              onPress={() => router.push("/create-minder")}
+              accessibilityLabel="Create your first minder"
+              accessibilityRole="button"
+            >
+              <Text style={styles.emptyButtonText}>
+                Create Your First Minder
+              </Text>
+            </TouchableOpacity>
           </View>
         }
       />
@@ -642,6 +943,7 @@ export default function HomeScreen() {
         animationType="fade"
         visible={noteModalVisible}
         onRequestClose={() => setNoteModalVisible(false)}
+        accessibilityViewIsModal
       >
         <View style={styles.modalOverlay}>
           <View
@@ -649,6 +951,8 @@ export default function HomeScreen() {
               styles.modalCard,
               { backgroundColor: colors.card, borderColor: colors.border },
             ]}
+            accessibilityRole="none"
+            accessibilityLabel="Add log dialog"
           >
             <Text style={[styles.modalTitle, { color: colors.text }]}>
               Add a quick log
@@ -673,6 +977,9 @@ export default function HomeScreen() {
                       borderColor: colors.border,
                     },
                   ]}
+                  accessibilityLabel={`Set mood to ${mood}`}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: noteMood === mood }}
                 >
                   <Text
                     style={{
@@ -681,10 +988,10 @@ export default function HomeScreen() {
                     }}
                   >
                     {mood === "good"
-                      ? "Good"
+                      ? "😊 Good"
                       : mood === "neutral"
-                        ? "Neutral"
-                        : "Bad"}
+                        ? "😐 Neutral"
+                        : "😟 Not great"}
                   </Text>
                 </TouchableOpacity>
               ))}
@@ -699,6 +1006,7 @@ export default function HomeScreen() {
                 styles.modalInput,
                 { color: colors.text, borderColor: colors.border },
               ]}
+              accessibilityLabel="Reflection text"
             />
             <View style={styles.modalButtons}>
               <TouchableOpacity
@@ -707,6 +1015,8 @@ export default function HomeScreen() {
                   styles.modalButton,
                   { backgroundColor: colors.card, borderColor: colors.border },
                 ]}
+                accessibilityLabel="Cancel"
+                accessibilityRole="button"
               >
                 <Text style={{ color: colors.text, fontWeight: "600" }}>
                   Cancel
@@ -721,6 +1031,8 @@ export default function HomeScreen() {
                     borderColor: colors.primary,
                   },
                 ]}
+                accessibilityLabel="Save log entry"
+                accessibilityRole="button"
               >
                 <Text style={{ color: "white", fontWeight: "700" }}>Save</Text>
               </TouchableOpacity>
@@ -738,6 +1050,22 @@ const styles = StyleSheet.create({
     padding: 16,
     alignItems: "center",
   },
+  permBanner: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "#E57373",
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 10,
+  },
+  permBannerText: {
+    color: "white",
+    fontSize: 13,
+    fontWeight: "600",
+    flex: 1,
+  },
   header: {
     width: "100%",
     flexDirection: "row",
@@ -749,27 +1077,56 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: "bold",
   },
-  subtitle: {
-    fontSize: 16,
-    marginBottom: 16,
-    textAlign: "center",
-  },
   addButton: {
     paddingVertical: 8,
     paddingHorizontal: 12,
     borderRadius: 8,
     shadowColor: "#000",
-    shadowOffset: {
-      width: 0,
-      height: 2,
-    },
+    shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.25,
     shadowRadius: 3.84,
     elevation: 5,
   },
+  reorderButton: {
+    padding: 8,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   addButtonText: {
     color: "white",
     fontWeight: "bold",
+    fontSize: 16,
+  },
+  emptyState: {
+    alignItems: "center",
+    paddingTop: 60,
+    paddingHorizontal: 24,
+    gap: 16,
+  },
+  emptyEmoji: {
+    fontSize: 64,
+  },
+  emptyTitle: {
+    fontSize: 22,
+    fontWeight: "800",
+    textAlign: "center",
+  },
+  emptySubtitle: {
+    fontSize: 15,
+    textAlign: "center",
+    opacity: 0.7,
+    lineHeight: 22,
+  },
+  emptyButton: {
+    marginTop: 8,
+    paddingVertical: 14,
+    paddingHorizontal: 32,
+    borderRadius: 12,
+  },
+  emptyButtonText: {
+    color: "white",
+    fontWeight: "700",
     fontSize: 16,
   },
   minderItem: {
@@ -780,10 +1137,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     shadowColor: "#000",
-    shadowOffset: {
-      width: 0,
-      height: 2,
-    },
+    shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.23,
     shadowRadius: 2.62,
     elevation: 4,
@@ -792,21 +1146,56 @@ const styles = StyleSheet.create({
     flex: 1,
     marginRight: 16,
   },
+  minderNameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
   minderName: {
     fontSize: 18,
     fontWeight: "bold",
     flexShrink: 1,
+  },
+  pausedBadge: {
+    backgroundColor: "rgba(0,0,0,0.25)",
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  pausedBadgeText: {
+    color: "white",
+    fontSize: 11,
+    fontWeight: "700",
   },
   minderNote: {
     fontSize: 14,
     marginTop: 4,
     opacity: 0.9,
   },
+  statsStrip: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 8,
+  },
+  statPill: {
+    backgroundColor: "rgba(0,0,0,0.22)",
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  statPillText: {
+    color: "white",
+    fontSize: 11,
+    fontWeight: "700",
+  },
   continuousContainer: {
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
     marginTop: 12,
+    flexWrap: "wrap",
   },
   continuousButtons: {
     flexDirection: "row",
@@ -889,14 +1278,5 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     borderRadius: 10,
     borderWidth: 1,
-  },
-  exampleItem: {
-    padding: 16,
-    borderRadius: 8,
-    marginBottom: 12,
-  },
-  exampleName: {
-    fontSize: 16,
-    fontStyle: "italic",
   },
 })

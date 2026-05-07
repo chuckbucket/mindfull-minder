@@ -4,6 +4,7 @@ import * as TaskManager from 'expo-task-manager';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { log } from './Logger';
 import { scheduleNotificationsForAllMinders } from './NotificationManager';
+import { scheduleHolidayNotifications } from './HolidayManager';
 
 const MINDERS_STORAGE_KEY = '@minders';
 export const BACKGROUND_FETCH_TASK = 'MINDFULL_MINDER_BG_FETCH';
@@ -33,6 +34,7 @@ const needsRescheduling = async (): Promise<boolean> => {
 TaskManager.defineTask(BACKGROUND_FETCH_TASK, async () => {
     try {
         log.info('[BG] Background fetch task started');
+        await scheduleHolidayNotifications();
         if (await needsRescheduling()) {
             log.info('[BG] Rescheduling notifications');
             await scheduleNotificationsForAllMinders();
