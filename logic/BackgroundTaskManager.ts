@@ -7,7 +7,17 @@ import { scheduleNotificationsForAllMinders } from './NotificationManager';
 import { scheduleHolidayNotifications } from './HolidayManager';
 
 const MINDERS_STORAGE_KEY = '@minders';
+const LAST_BG_REFRESH_KEY = '@last_background_refresh_at';
 export const BACKGROUND_FETCH_TASK = 'MINDFULL_MINDER_BG_FETCH';
+const BG_REFRESH_INTERVAL_MS = 20 * 60 * 60 * 1000; // refresh at most once every ~20h in background
+
+const shouldRunDailyRefresh = async (): Promise<boolean> => {
+    const raw = await AsyncStorage.getItem(LAST_BG_REFRESH_KEY);
+    if (!raw) return true;
+    const last = Number(raw);
+    if (!Number.isFinite(last)) return true;
+    return Date.now() - last >= BG_REFRESH_INTERVAL_MS;
+};
 
 const needsRescheduling = async (): Promise<boolean> => {
     const scheduled = await Notifications.getAllScheduledNotificationsAsync();
@@ -34,10 +44,15 @@ const needsRescheduling = async (): Promise<boolean> => {
 TaskManager.defineTask(BACKGROUND_FETCH_TASK, async () => {
     try {
         log.info('[BG] Background fetch task started');
-        await scheduleHolidayNotifications();
-        if (await needsRescheduling()) {
-            log.info('[BG] Rescheduling notifications');
-            await scheduleNotificationsForAllMinders();
+        if (await shouldRunDailyRefresh()) {
+            await scheduleHolidayNotifications();
+            if (await needsRescheduling()) {
+                log.info('[BG] Rescheduling notifications');
+                await scheduleNotificationsForAllMinders();
+            }
+            await AsyncStorage.setItem(LAST_BG_REFRESH_KEY, String(Date.now()));
+        } else {
+            log.info('[BG] Skipping refresh (recently run)');
         }
         log.info('[BG] Background fetch task completed');
         return BackgroundFetch.BackgroundFetchResult.NewData;
@@ -55,7 +70,7 @@ export const registerBackgroundFetchTask = async (): Promise<void> => {
             return;
         }
         await BackgroundFetch.registerTaskAsync(BACKGROUND_FETCH_TASK, {
-            minimumInterval: 15 * 60,
+            minimumInterval: 24 * 60 * 60,
             stopOnTerminate: false,
             startOnBoot: true,
         });

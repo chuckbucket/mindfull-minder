@@ -105,9 +105,12 @@ export default function HomeScreen() {
 
   const { colors } = useTheme()
   const router = useRouter()
-  const { openLogFor, logTriggerAt } = useLocalSearchParams<{
+  const { openLogFor, logTriggerAt, openCompleteFor, openCompleteMinderName, completeTriggerAt } = useLocalSearchParams<{
     openLogFor?: string
     logTriggerAt?: string
+    openCompleteFor?: string
+    openCompleteMinderName?: string
+    completeTriggerAt?: string
   }>()
 
   useEffect(() => {
@@ -123,6 +126,25 @@ export default function HomeScreen() {
     )
     router.setParams({ openLogFor: undefined, logTriggerAt: undefined })
   }, [openLogFor])
+
+  useEffect(() => {
+    if (!openCompleteFor) return
+    const ta = completeTriggerAt ? Number(completeTriggerAt) : undefined
+    const triggerAtMs = typeof ta === "number" && !isNaN(ta) ? ta : undefined
+    const displayName = openCompleteMinderName || "minder"
+    router.setParams({ openCompleteFor: undefined, openCompleteMinderName: undefined, completeTriggerAt: undefined })
+    Alert.alert(
+      "Mark Complete?",
+      `Mark "${displayName}" as complete?`,
+      [
+        { text: "Not yet", style: "cancel" },
+        {
+          text: "Mark Complete",
+          onPress: () => handleComplete(openCompleteFor, triggerAtMs),
+        },
+      ],
+    )
+  }, [openCompleteFor])
 
   const checkNotifPermission = useCallback(async () => {
     const { status } = await Notifications.getPermissionsAsync()

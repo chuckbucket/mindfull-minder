@@ -1,4 +1,4 @@
-export const PROD_OVERRIDE = true // Set to true to force production settings even in development environment
+export const PROD_OVERRIDE = false // Set to true to force production settings even in development environment
 
 const IS_DEV = process.env.APP_VARIANT === "development"
 
@@ -61,6 +61,12 @@ export default {
   experiments: {
     typedRoutes: true,
     reactCompiler: true,
+  },
+  runtimeVersion: {
+    policy: "appVersion",
+  },
+  updates: {
+    url: "https://u.expo.dev/deaf59fa-fe50-41fa-bb04-becca07324cb",
   },
   extra: {
     router: {},

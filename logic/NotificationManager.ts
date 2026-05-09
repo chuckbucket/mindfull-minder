@@ -6,6 +6,44 @@ import { isWithinTimeWindow, moveDateIntoTimeWindow, parseClockTimeToMinutes } f
 
 const MINDERS_STORAGE_KEY = '@minders';
 const IOS_NOTIFICATION_LIMIT = 64;
+const NOTIFICATION_STATS_KEY = '@notificationStats';
+
+export type NotificationStats = {
+    updatedAt: string;
+    minderRun?: {
+        mindersProcessed: number;
+        planned: number;
+        scheduled: number;
+        availableSlotsAtStart: number;
+    };
+    holidayRun?: {
+        holidaysEnabled: number;
+        holidaysInRange: number;
+        scheduled: number;
+        availableSlotsAtStart: number;
+    };
+};
+
+export const getNotificationStats = async (): Promise<NotificationStats | null> => {
+    const raw = await AsyncStorage.getItem(NOTIFICATION_STATS_KEY);
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw) as NotificationStats;
+    } catch {
+        return null;
+    }
+};
+
+export const saveMinderNotificationStats = async (minderRun: NotificationStats['minderRun']): Promise<void> => {
+    if (!minderRun) return;
+    const existing = await getNotificationStats();
+    const next: NotificationStats = {
+        updatedAt: new Date().toISOString(),
+        minderRun,
+        holidayRun: existing?.holidayRun,
+    };
+    await AsyncStorage.setItem(NOTIFICATION_STATS_KEY, JSON.stringify(next));
+};
 
 export const scheduleNotificationsForAllMinders = async () => {
     log.info('Scheduling notifications for all minders...');
@@ -22,22 +60,34 @@ export const scheduleNotificationsForAllMinders = async () => {
     if (!storedMinders) return;
 
     const minders = JSON.parse(storedMinders);
+    let totalPlanned = 0;
+    let totalScheduled = 0;
+    let availableSlotsAtStart = 0;
     for (const minder of minders) {
-        await scheduleNotificationsForMinder(minder);
+        const result = await scheduleNotificationsForMinder(minder);
+        totalPlanned += result.planned;
+        totalScheduled += result.scheduled;
+        availableSlotsAtStart = Math.max(availableSlotsAtStart, result.availableSlotsAtStart);
     }
+    await saveMinderNotificationStats({
+        mindersProcessed: minders.length,
+        planned: totalPlanned,
+        scheduled: totalScheduled,
+        availableSlotsAtStart,
+    });
     log.info('Finished scheduling notifications for all minders.');
 };
 
 export const scheduleNotificationsForMinder = async (
     minderData: any,
     onProgress?: (progress: number) => void,
-): Promise<{ scheduled: number; planned: number }> => {
+): Promise<{ scheduled: number; planned: number; availableSlotsAtStart: number }> => {
     log.info(`Scheduling notifications for minder: ${minderData.name}`);
     await cancelNotificationsForMinder(minderData.id);
 
     if (minderData.paused || minderData.reminderFrequency === 'Continuous') {
         onProgress?.(1);
-        return { scheduled: 0, planned: 0 };
+        return { scheduled: 0, planned: 0, availableSlotsAtStart: 0 };
     }
 
     const allScheduled = await Notifications.getAllScheduledNotificationsAsync();
@@ -48,7 +98,7 @@ export const scheduleNotificationsForMinder = async (
     if (availableSlots <= 0) {
         log.warn('No available notification slots.');
         onProgress?.(1);
-        return { scheduled: 0, planned: 0 };
+        return { scheduled: 0, planned: 0, availableSlotsAtStart: 0 };
     }
 
     const now = new Date();
@@ -153,8 +203,8 @@ export const scheduleNotificationsForMinder = async (
                 content: {
                     title: minderData.name,
                     body: minderData.note?.trim() || 'Reminder',
-                    data: { minderId: minderData.id, minderName: minderData.name },
-                    categoryIdentifier: 'MINDER_REMINDER',
+                    data: { minderId: minderData.id, minderName: minderData.name, minderType: minderData.minderType ?? 'complete' },
+                    categoryIdentifier: minderData.minderType === 'note' ? 'MINDER_NOTE' : 'MINDER_COMPLETE',
                     sticky: true,
                 },
                 trigger: {
@@ -173,7 +223,7 @@ export const scheduleNotificationsForMinder = async (
 
     // Ensure progress reaches 100% even if there are no notifications
     onProgress?.(1);
-    return { scheduled: scheduledCount, planned: newNotificationTimes.length };
+    return { scheduled: scheduledCount, planned: newNotificationTimes.length, availableSlotsAtStart: availableSlots };
 };
 
 export const cancelNotificationsForMinder = async (minderId: string) => {

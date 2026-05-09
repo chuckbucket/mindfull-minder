@@ -1,11 +1,14 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import { log } from './Logger';
+import { getNotificationStats } from './NotificationManager';
 
 const HOLIDAYS_KEY = '@holidays';
 const IOS_NOTIFICATION_LIMIT = 64;
 const NOTIFICATION_HOUR = 9; // 9 AM local time
-const REMINDER_OFFSETS = [45, 30, 15, 7, 6, 5, 4, 3, 2, 1, 0]; // days before event
+const MAX_LOOKAHEAD_DAYS = 45;
+const FIRST_REMINDER_OFFSET = 45;
+const NOTIFICATION_STATS_KEY = '@notificationStats';
 
 export type HolidayType = 'builtin' | 'birthday' | 'anniversary' | 'custom';
 
@@ -102,6 +105,31 @@ function buildMessage(holiday: Holiday, daysRemaining: number, eventYear: number
   return { title: `${displayName} is in ${daysRemaining} days`, body: 'Mark your calendar!' };
 }
 
+function startOfDay(d: Date): Date {
+  const date = new Date(d);
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function diffInDays(from: Date, to: Date): number {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return Math.floor((startOfDay(to).getTime() - startOfDay(from).getTime()) / msPerDay);
+}
+
+function getStartOfWeek(d: Date): Date {
+  const date = startOfDay(d);
+  date.setDate(date.getDate() - date.getDay()); // Sunday start
+  return date;
+}
+
+function isInCurrentWeek(target: Date, now: Date): boolean {
+  const weekStart = getStartOfWeek(now);
+  const weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekEnd.getDate() + 7);
+  const day = startOfDay(target);
+  return day >= weekStart && day < weekEnd;
+}
+
 export async function scheduleHolidayNotifications(): Promise<void> {
   const { status } = await Notifications.getPermissionsAsync();
   if (status !== 'granted') return;
@@ -113,14 +141,34 @@ export async function scheduleHolidayNotifications(): Promise<void> {
   let slotsAvailable = IOS_NOTIFICATION_LIMIT - allScheduled.length;
 
   const holidays = await getHolidays();
+  const enabledHolidays = holidays.filter(h => h.enabled);
   const now = new Date();
   let scheduledCount = 0;
+  let holidaysInRange = 0;
 
-  for (const holiday of holidays.filter(h => h.enabled)) {
+  for (const holiday of enabledHolidays) {
     if (slotsAvailable <= 0) break;
     const eventDate = getNextOccurrence(holiday);
+    const daysUntilEvent = diffInDays(now, eventDate);
 
-    for (const daysRemaining of REMINDER_OFFSETS) {
+    // Only schedule holidays that occur in the next 45 days.
+    if (daysUntilEvent < 0 || daysUntilEvent > MAX_LOOKAHEAD_DAYS) continue;
+    holidaysInRange++;
+
+    const candidateOffsets = new Set<number>();
+    candidateOffsets.add(0); // Holiday day
+    if (daysUntilEvent >= FIRST_REMINDER_OFFSET) {
+      candidateOffsets.add(FIRST_REMINDER_OFFSET); // First reminder
+    }
+    for (let days = 1; days <= 7; days++) {
+      const reminderDate = new Date(eventDate);
+      reminderDate.setDate(reminderDate.getDate() - days);
+      if (isInCurrentWeek(reminderDate, now)) {
+        candidateOffsets.add(days); // Current-week reminder
+      }
+    }
+
+    for (const daysRemaining of Array.from(candidateOffsets).sort((a, b) => b - a)) {
       if (slotsAvailable <= 0) break;
 
       const reminderDate = new Date(eventDate);
@@ -149,6 +197,21 @@ export async function scheduleHolidayNotifications(): Promise<void> {
       }
     }
   }
+
+  const existingStats = await getNotificationStats();
+  await AsyncStorage.setItem(
+    NOTIFICATION_STATS_KEY,
+    JSON.stringify({
+      updatedAt: new Date().toISOString(),
+      minderRun: existingStats?.minderRun,
+      holidayRun: {
+        holidaysEnabled: enabledHolidays.length,
+        holidaysInRange,
+        scheduled: scheduledCount,
+        availableSlotsAtStart: IOS_NOTIFICATION_LIMIT - allScheduled.length,
+      },
+    }),
+  );
 
   log.info(`Scheduled ${scheduledCount} holiday notifications.`);
 }

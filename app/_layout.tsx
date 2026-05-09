@@ -75,18 +75,21 @@ function RootLayoutNav() {
     };
     void checkOnboarding();
 
-    void Notifications.setNotificationCategoryAsync('MINDER_REMINDER', [
+    void Notifications.setNotificationCategoryAsync('MINDER_COMPLETE', [
       {
         identifier: 'COMPLETE',
         buttonTitle: 'Mark Complete',
         options: { opensAppToForeground: false },
       },
+    ]);
+    void Notifications.setNotificationCategoryAsync('MINDER_NOTE', [
       {
         identifier: 'LOG',
         buttonTitle: 'Add Log',
         options: { opensAppToForeground: true },
       },
     ]);
+    void Notifications.deleteNotificationCategoryAsync('MINDER_REMINDER');
 
     const onReceived = Notifications.addNotificationReceivedListener(notification => {
       const minderId = (notification.request.content.data as any)?.minderId;
@@ -125,8 +128,23 @@ function RootLayoutNav() {
         return;
       }
 
+      const minderType = (response.notification.request.content.data as any)?.minderType ?? 'complete';
+      const minderName = (response.notification.request.content.data as any)?.minderName ?? '';
       const id = `opened:${minderId}:${typeof triggerAt === 'number' && !Number.isNaN(triggerAt) ? triggerAt : at}`;
       void addMinderEvent({ id, minderId, kind: 'triggered', at, triggerAt });
+
+      if (minderType === 'complete') {
+        void Notifications.dismissNotificationAsync(response.notification.request.identifier);
+        router.push({
+          pathname: '/(tabs)',
+          params: {
+            openCompleteFor: minderId,
+            openCompleteMinderName: minderName,
+            completeTriggerAt: String(triggerAt ?? ''),
+          },
+        });
+        return;
+      }
     });
 
     void registerBackgroundFetchTask();

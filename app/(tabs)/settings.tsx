@@ -4,17 +4,28 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Modal, ScrollView, Share, StyleSheet, Switch, Text, TouchableOpacity, View } from 'react-native';
 import { useRouter } from 'expo-router';
 import Constants from 'expo-constants';
+import * as Clipboard from 'expo-clipboard';
 import * as Updates from 'expo-updates';
 import { useTheme } from '../../context/ThemeContext';
 import { themes } from '../../styles/themes';
 import { setLogLevel, getLogs } from '../../logic/Logger';
-import { getAllMinderEvents } from '../../logic/MinderEvents';
-import { scheduleNotificationsForAllMinders } from '../../logic/NotificationManager';
+import { addMinderEvent, clearAllMinderEvents, getAllMinderEvents, type MinderEvent } from '../../logic/MinderEvents';
+import { getNotificationStats, scheduleNotificationsForAllMinders, type NotificationStats } from '../../logic/NotificationManager';
+import { scheduleHolidayNotifications } from '../../logic/HolidayManager';
 import { CHANGELOG, type ChangelogBullet } from '../../constants/changelog';
 
 const LOG_LEVEL_KEY = '@logLevel';
 const MINDERS_KEY = '@minders';
 const QUIET_HOURS_KEY = '@quietHours';
+const HOLIDAYS_KEY = '@holidays';
+
+type BackupPayload = {
+  exportedAt: string;
+  appVersion: string;
+  minders: unknown[];
+  events: MinderEvent[];
+  holidays?: unknown[];
+};
 
 const TIME_OPTIONS: string[] = [];
 for (let minutes = 0; minutes < 24 * 60; minutes += 30) {
@@ -78,6 +89,7 @@ export default function SettingsScreen() {
   const [quietEnd, setQuietEnd] = useState('07:00');
   const [qhPickerVisible, setQhPickerVisible] = useState(false);
   const [qhPickerTarget, setQhPickerTarget] = useState<'start' | 'end'>('start');
+  const [notificationStats, setNotificationStats] = useState<NotificationStats | null>(null);
   const qhPickerScrollRef = useRef<ScrollView>(null);
   const appVersion = Constants.expoConfig?.version ?? Constants.nativeAppVersion ?? 'unknown';
   const buildNumber = Constants.expoConfig?.ios?.buildNumber ?? Constants.expoConfig?.android?.versionCode ?? Constants.nativeBuildVersion ?? 'unknown';
@@ -100,6 +112,9 @@ export default function SettingsScreen() {
           // ignore
         }
       }
+
+      const stats = await getNotificationStats();
+      setNotificationStats(stats);
     };
     void load();
   }, []);
@@ -161,6 +176,97 @@ export default function SettingsScreen() {
       });
     } catch {
       Alert.alert('Export Failed', 'Could not export your data. Please try again.');
+    }
+  };
+
+  const buildBackupPayload = async (): Promise<BackupPayload> => {
+    const mindersRaw = await AsyncStorage.getItem(MINDERS_KEY);
+    const holidaysRaw = await AsyncStorage.getItem(HOLIDAYS_KEY);
+    const events = await getAllMinderEvents();
+    return {
+      exportedAt: new Date().toISOString(),
+      appVersion: String(appVersion),
+      minders: mindersRaw ? JSON.parse(mindersRaw) : [],
+      events,
+      holidays: holidaysRaw ? JSON.parse(holidaysRaw) : [],
+    };
+  };
+
+  const handleCopyBackupToClipboard = async () => {
+    try {
+      const payload = await buildBackupPayload();
+      await Clipboard.setStringAsync(JSON.stringify(payload, null, 2));
+      Alert.alert('Copied', 'Backup data was copied to your clipboard.');
+    } catch {
+      Alert.alert('Copy Failed', 'Could not copy backup data to clipboard.');
+    }
+  };
+
+  const applyImportedBackup = async (payload: BackupPayload) => {
+    await AsyncStorage.setItem(MINDERS_KEY, JSON.stringify(payload.minders));
+    if (Array.isArray(payload.holidays)) {
+      await AsyncStorage.setItem(HOLIDAYS_KEY, JSON.stringify(payload.holidays));
+    }
+
+    await clearAllMinderEvents();
+    for (const event of payload.events) {
+      if (!event?.minderId || !event?.kind || typeof event?.at !== 'number') continue;
+      await addMinderEvent({
+        id: event.id,
+        minderId: event.minderId,
+        kind: event.kind,
+        at: event.at,
+        text: event.text,
+        triggerAt: event.triggerAt,
+        mood: event.mood,
+      });
+    }
+
+    await scheduleNotificationsForAllMinders();
+    await scheduleHolidayNotifications();
+  };
+
+  const handleImportFromClipboard = async () => {
+    try {
+      const clipboardText = await Clipboard.getStringAsync();
+      if (!clipboardText?.trim()) {
+        Alert.alert('Clipboard Empty', 'No backup JSON was found in your clipboard.');
+        return;
+      }
+
+      const parsed = JSON.parse(clipboardText) as Partial<BackupPayload>;
+      if (!Array.isArray(parsed.minders) || !Array.isArray(parsed.events)) {
+        Alert.alert('Invalid Backup', 'Clipboard data is not a valid backup format.');
+        return;
+      }
+
+      Alert.alert(
+        'Import Backup',
+        'This will replace current minders and history on this device. Continue?',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Import',
+            style: 'destructive',
+            onPress: () => {
+              void (async () => {
+                await applyImportedBackup({
+                  exportedAt: parsed.exportedAt ?? new Date().toISOString(),
+                  appVersion: parsed.appVersion ?? 'unknown',
+                  minders: parsed.minders ?? [],
+                  events: parsed.events as MinderEvent[],
+                  holidays: Array.isArray(parsed.holidays) ? parsed.holidays : [],
+                });
+                Alert.alert('Import Complete', 'Backup data has been imported from clipboard.');
+              })().catch(() => {
+                Alert.alert('Import Failed', 'Could not import backup data from clipboard.');
+              });
+            },
+          },
+        ],
+      );
+    } catch {
+      Alert.alert('Import Failed', 'Clipboard does not contain valid JSON backup data.');
     }
   };
 
@@ -281,6 +387,24 @@ export default function SettingsScreen() {
       </TouchableOpacity>
 
       <TouchableOpacity
+        style={[styles.button, { backgroundColor: colors.primary }]}
+        onPress={handleCopyBackupToClipboard}
+        accessibilityLabel="Copy backup data to clipboard"
+        accessibilityRole="button"
+      >
+        <Text style={styles.buttonText}>Copy Backup to Clipboard</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        style={[styles.button, { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border }]}
+        onPress={handleImportFromClipboard}
+        accessibilityLabel="Import backup data from clipboard"
+        accessibilityRole="button"
+      >
+        <Text style={[styles.buttonText, { color: colors.text }]}>Import Backup from Clipboard</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
         style={[styles.button, { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border }]}
         onPress={viewLogs}
         accessibilityLabel="View debug logs"
@@ -394,6 +518,64 @@ export default function SettingsScreen() {
         <View style={styles.infoRow}>
           <Text style={[styles.infoKey, { color: colors.text }]}>Ownership</Text>
           <Text style={[styles.infoValue, { color: colors.text }]}>{appOwnership}</Text>
+        </View>
+      </View>
+
+      <Text style={[styles.sectionHeader, { color: colors.text }]}>Notification Stats</Text>
+      <View style={[styles.infoCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <View style={styles.infoRow}>
+          <Text style={[styles.infoKey, { color: colors.text }]}>Last Updated</Text>
+          <Text style={[styles.infoValue, { color: colors.text }]}>
+            {notificationStats?.updatedAt ?? 'Never'}
+          </Text>
+        </View>
+        <View style={styles.infoRow}>
+          <Text style={[styles.infoKey, { color: colors.text }]}>Minders Processed</Text>
+          <Text style={[styles.infoValue, { color: colors.text }]}>
+            {notificationStats?.minderRun?.mindersProcessed ?? 0}
+          </Text>
+        </View>
+        <View style={styles.infoRow}>
+          <Text style={[styles.infoKey, { color: colors.text }]}>Minder Times Calculated</Text>
+          <Text style={[styles.infoValue, { color: colors.text }]}>
+            {notificationStats?.minderRun?.planned ?? 0}
+          </Text>
+        </View>
+        <View style={styles.infoRow}>
+          <Text style={[styles.infoKey, { color: colors.text }]}>Minders Scheduled</Text>
+          <Text style={[styles.infoValue, { color: colors.text }]}>
+            {notificationStats?.minderRun?.scheduled ?? 0}
+          </Text>
+        </View>
+        <View style={styles.infoRow}>
+          <Text style={[styles.infoKey, { color: colors.text }]}>Minder Slots Available</Text>
+          <Text style={[styles.infoValue, { color: colors.text }]}>
+            {notificationStats?.minderRun?.availableSlotsAtStart ?? 0}
+          </Text>
+        </View>
+        <View style={styles.infoRow}>
+          <Text style={[styles.infoKey, { color: colors.text }]}>Enabled Holidays</Text>
+          <Text style={[styles.infoValue, { color: colors.text }]}>
+            {notificationStats?.holidayRun?.holidaysEnabled ?? 0}
+          </Text>
+        </View>
+        <View style={styles.infoRow}>
+          <Text style={[styles.infoKey, { color: colors.text }]}>Holidays Within 45 Days</Text>
+          <Text style={[styles.infoValue, { color: colors.text }]}>
+            {notificationStats?.holidayRun?.holidaysInRange ?? 0}
+          </Text>
+        </View>
+        <View style={styles.infoRow}>
+          <Text style={[styles.infoKey, { color: colors.text }]}>Holiday Notifications Scheduled</Text>
+          <Text style={[styles.infoValue, { color: colors.text }]}>
+            {notificationStats?.holidayRun?.scheduled ?? 0}
+          </Text>
+        </View>
+        <View style={styles.infoRow}>
+          <Text style={[styles.infoKey, { color: colors.text }]}>Holiday Slots Available</Text>
+          <Text style={[styles.infoValue, { color: colors.text }]}>
+            {notificationStats?.holidayRun?.availableSlotsAtStart ?? 0}
+          </Text>
         </View>
       </View>
 
